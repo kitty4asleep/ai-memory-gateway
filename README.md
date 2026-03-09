@@ -94,8 +94,8 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 | `MIN_SCORE_THRESHOLD` | 记忆搜索最低分数阈值，低于此分数的记忆不注入（0=不过滤） | `0.15` |
 | `MEMORY_EXTRACT_INTERVAL` | 记忆提取间隔（0=禁用/1=每轮/N=每N轮） | `1` |
 | `TIMEZONE_HOURS` | 时区偏移（小时），用于记忆注入时的日期显示 | `8`（UTC+8） |
-| `FORCE_STREAM` | 强制所有请求走流式传输（解决部分客户端thinking不显示） | `false` |
-| `REASONING_EFFORT` | 推理强度（low/medium/high），注入请求启用思维链。注意部分模型不支持 medium | 留空不注入 |
+| `FORCE_STREAM（可选）` | 强制所有请求走流式传输（解决部分客户端thinking不显示） | `false` |
+| `REASONING_EFFORT（可选）` | 推理强度（low/medium/high），注入请求启用思维链。注意部分模型不支持 medium | 留空不注入 |
 
 **3. 重新部署**
 
