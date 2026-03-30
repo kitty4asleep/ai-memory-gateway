@@ -21,14 +21,13 @@ from database import (
 )
 from memory_extractor import extract_memories, score_memories
 
-# 从独立配置文件加载路由/别名
-from routing_config import MODEL_ROUTING, MODEL_ALIASES
+# 路由配置（以后只改 routing_config.py）
+from routing_config import PROVIDERS, MODEL_ROUTING, MODEL_ALIASES
 
+# ==== 工具：别名解析 / 上游路由 ====
 def resolve_model_alias(raw_model: str):
-    # 先看别名表
     if raw_model in MODEL_ALIASES:
         raw_model = MODEL_ALIASES[raw_model]
-    # 再看是否匹配路由表键
     if raw_model in MODEL_ROUTING:
         prefix, real_model = MODEL_ROUTING[raw_model]
         return f"{prefix}/{real_model}"
@@ -39,17 +38,38 @@ def resolve_provider(model_name: str):
         prefix, real_model = model_name.split("/", 1)
     else:
         prefix, real_model = None, model_name
-    if prefix == "zhenhaoji":
-        return {"base_url": os.environ["ZHENHAOJI_BASE_URL"], "api_key": os.environ["ZHENHAOJI_API_KEY"], "model": real_model}
-    if prefix == "sunlea":
-        return {"base_url": os.environ["SUNLEA_BASE_URL"], "api_key": os.environ["SUNLEA_API_KEY"], "model": real_model}
-    if prefix == "fuka":
-        return {"base_url": os.environ["FUKA_BASE_URL"], "api_key": os.environ["FUKA_API_KEY"], "model": real_model}
-    if prefix == "qmbabyy":
-        return {"base_url": os.environ["QMBABYY_BASE_URL"], "api_key": os.environ["QMBABYY_API_KEY"], "model": real_model}
-    return {"base_url": os.environ["API_BASE_URL"], "api_key": os.environ["API_KEY"], "model": model_name}
+    if prefix and prefix in PROVIDERS:
+        base_env, key_env = PROVIDERS[prefix]
+        return {
+            "base_url": os.environ[base_env],
+            "api_key": os.environ[key_env],
+            "model": real_model,
+        }
+    # 默认上游（无前缀或未匹配）
+    return {
+        "base_url": os.environ["API_BASE_URL"],
+        "api_key": os.environ["API_KEY"],
+        "model": model_name,
+    }
 
-# 配置
+# ==== 工具：上下文截断防巨长账单 ====
+MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "8000"))
+def trim_messages_by_chars(messages, limit=MAX_PROMPT_CHARS):
+    """从后往前保留消息，直到字符数不超过 limit"""
+    total = 0
+    trimmed = []
+    for msg in reversed(messages):
+        content = msg.get("content", "")
+        text = content if isinstance(content, str) else str(content)
+        total += len(text)
+        if total > limit:
+            break
+        trimmed.append(msg)
+    return list(reversed(trimmed))
+
+# ============================================================
+# 配置项
+# ============================================================
 API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "anthropic/claude-sonnet-4")
@@ -127,13 +147,8 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
 # 记忆应用
 - 像朋友般自然运用这些记忆，不刻意展示
 - 仅在相关话题出现时引用，避免主动提及
-- 对重要信息（如健康、日期、约定）保持一致性
-- 新信息与记忆冲突时，以新信息为准
-- 模糊记忆可表达不确定性："记得你似乎说过..."
-# 交流方式
-- 自然引用："记得你说过..."或"上次我们聊到..."
-- 避免机械式表达如"根据我的记忆..."或"检索到的信息显示..."
-- 共同经历可温情回忆："上次那个事挺好玩的"
+- 对重要信息保持一致性；冲突以新信息为准
+- 模糊记忆可表达不确定性
 记忆是丰富对话的工具，而非对话焦点。"""
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return enhanced_prompt
@@ -151,17 +166,14 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
             return
         _round_counter += 1
         if MEMORY_EXTRACT_INTERVAL > 1 and (_round_counter % MEMORY_EXTRACT_INTERVAL != 0):
-            print(f"⏭️ 轮次 {_round_counter}，跳过记忆提取（每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次）")
+            print(f"⏭️ 轮次 {_round_counter}，跳过记忆提取（每 {MEMORY_EXTRACT_INTERVAL} 轮）")
             return
-        if MEMORY_EXTRACT_INTERVAL > 1:
-            print(f"📝 轮次 {_round_counter}，执行记忆提取")
         existing = await get_recent_memories(limit=80)
         existing_contents = [r["content"] for r in existing]
         if context_messages:
             tail_count = MEMORY_EXTRACT_INTERVAL * 2
             recent_msgs = list(context_messages)[-tail_count:] if len(context_messages) > tail_count else list(context_messages)
             messages_for_extraction = recent_msgs + [{"role": "assistant", "content": assistant_msg}]
-            print(f"📝 截取最近 {MEMORY_EXTRACT_INTERVAL} 轮对话提取记忆（{len(messages_for_extraction)} 条消息）")
         else:
             messages_for_extraction = [
                 {"role": "user", "content": user_msg},
@@ -173,18 +185,18 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
             "写入不完整", "检索功能", "系统没有返回", "关键词匹配", "语义匹配", "语义检索",
             "阈值", "数据库", "seed", "导入", "部署", "bug", "debug", "端口", "网关",
         ]
-        filtered_memories = []
+        filtered = []
         for mem in new_memories:
             content = mem["content"]
             if any(kw in content for kw in META_BLACKLIST):
                 print(f"🚫 过滤掉meta记忆: {content[:60]}...")
                 continue
-            filtered_memories.append(mem)
-        for mem in filtered_memories:
+            filtered.append(mem)
+        for mem in filtered:
             await save_memory(content=mem["content"], importance=mem["importance"], source_session=session_id)
-        if filtered_memories:
+        if filtered:
             total = await get_all_memories_count()
-            print(f"💾 已保存 {len(filtered_memories)} 条新记忆（过滤了 {len(new_memories) - len(filtered_memories)} 条），总计 {total} 条")
+            print(f"💾 已保存 {len(filtered)} 条新记忆，总计 {total} 条")
     except Exception as e:
         print(f"⚠️ 后台记忆处理失败: {e}")
 
@@ -227,6 +239,7 @@ async def chat_completions(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
 
+    # 提取用户最新消息
     user_message = ""
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -241,29 +254,32 @@ async def chat_completions(request: Request):
                 )
             break
 
+    # 构建 system prompt
     original_messages = [msg for msg in messages if msg.get("role") != "system"]
     if SYSTEM_PROMPT or (MEMORY_ENABLED and user_message):
-        if MEMORY_ENABLED and user_message:
-            enhanced_prompt = await build_system_prompt_with_memories(user_message)
-        else:
-            enhanced_prompt = SYSTEM_PROMPT
-        if enhanced_prompt:
+        enhanced = await build_system_prompt_with_memories(user_message) if (MEMORY_ENABLED and user_message) else SYSTEM_PROMPT
+        if enhanced:
             has_system = any(msg.get("role") == "system" for msg in messages)
             if has_system:
                 for i, msg in enumerate(messages):
                     if msg.get("role") == "system":
-                        messages[i]["content"] = enhanced_prompt + "\n\n" + msg["content"]
+                        messages[i]["content"] = enhanced + "\n\n" + msg["content"]
                         break
             else:
-                messages.insert(0, {"role": "system", "content": enhanced_prompt})
+                messages.insert(0, {"role": "system", "content": enhanced})
     body["messages"] = messages
 
+    # 截断上下文，防止超长账单
+    body["messages"] = trim_messages_by_chars(body["messages"], MAX_PROMPT_CHARS)
+
+    # 模型解析
     model = body.get("model", DEFAULT_MODEL) or DEFAULT_MODEL
     model = resolve_model_alias(model)
     body["model"] = model
 
     session_id = str(uuid.uuid4())[:8]
 
+    # 上游路由
     provider = resolve_provider(model)
     upstream_url = provider["base_url"]
     upstream_key = provider["api_key"]
