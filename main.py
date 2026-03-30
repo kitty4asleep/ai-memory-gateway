@@ -21,16 +21,14 @@ from database import (
 )
 from memory_extractor import extract_memories, score_memories
 
-# ==== 多上游模型路由映射 ====
-MODEL_ROUTING = {
-    "claude-opus-4-6-thinking": ("zhenhaoji", "claude-opus-4-6-thinking"),
-    "claude-sonnet-4-5-20250929": ("zhenhaoji", "claude-sonnet-4-5-20250929"),
-    "claude-sonnet-4.5[假流式]": ("sunlea", "claude-sonnet-4.5[假流式]"),
-    "[车厘子]claude-4.6-opus-thinking④": ("fuka", "[车厘子]claude-4.6-opus-thinking④"),
-    "claude-sonnet-4-6": ("qmbabyy", "claude-sonnet-4-6"),
-}
+# 从独立配置文件加载路由/别名
+from routing_config import MODEL_ROUTING, MODEL_ALIASES
 
 def resolve_model_alias(raw_model: str):
+    # 先看别名表
+    if raw_model in MODEL_ALIASES:
+        raw_model = MODEL_ALIASES[raw_model]
+    # 再看是否匹配路由表键
     if raw_model in MODEL_ROUTING:
         prefix, real_model = MODEL_ROUTING[raw_model]
         return f"{prefix}/{real_model}"
@@ -41,41 +39,17 @@ def resolve_provider(model_name: str):
         prefix, real_model = model_name.split("/", 1)
     else:
         prefix, real_model = None, model_name
-
     if prefix == "zhenhaoji":
-        return {
-            "base_url": os.environ["ZHENHAOJI_BASE_URL"],
-            "api_key": os.environ["ZHENHAOJI_API_KEY"],
-            "model": real_model,
-        }
+        return {"base_url": os.environ["ZHENHAOJI_BASE_URL"], "api_key": os.environ["ZHENHAOJI_API_KEY"], "model": real_model}
     if prefix == "sunlea":
-        return {
-            "base_url": os.environ["SUNLEA_BASE_URL"],
-            "api_key": os.environ["SUNLEA_API_KEY"],
-            "model": real_model,
-        }
+        return {"base_url": os.environ["SUNLEA_BASE_URL"], "api_key": os.environ["SUNLEA_API_KEY"], "model": real_model}
     if prefix == "fuka":
-        return {
-            "base_url": os.environ["FUKA_BASE_URL"],
-            "api_key": os.environ["FUKA_API_KEY"],
-            "model": real_model,
-        }
+        return {"base_url": os.environ["FUKA_BASE_URL"], "api_key": os.environ["FUKA_API_KEY"], "model": real_model}
     if prefix == "qmbabyy":
-        return {
-            "base_url": os.environ["QMBABYY_BASE_URL"],
-            "api_key": os.environ["QMBABYY_API_KEY"],
-            "model": real_model,
-        }
-    # 默认上游
-    return {
-        "base_url": os.environ["API_BASE_URL"],
-        "api_key": os.environ["API_KEY"],
-        "model": model_name,
-    }
+        return {"base_url": os.environ["QMBABYY_BASE_URL"], "api_key": os.environ["QMBABYY_API_KEY"], "model": real_model}
+    return {"base_url": os.environ["API_BASE_URL"], "api_key": os.environ["API_KEY"], "model": model_name}
 
-# ============================================================
-# 配置项
-# ============================================================
+# 配置
 API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "anthropic/claude-sonnet-4")
@@ -90,9 +64,6 @@ REASONING_EFFORT = os.getenv("REASONING_EFFORT", "")
 EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://ai-memory-gateway.local")
 EXTRA_TITLE = os.getenv("EXTRA_TITLE", "AI Memory Gateway")
 
-# ============================================================
-# 人设加载
-# ============================================================
 def load_system_prompt():
     prompt_path = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
     try:
@@ -110,9 +81,6 @@ if SYSTEM_PROMPT:
 else:
     print("ℹ️ 无人设，纯转发模式")
 
-# ============================================================
-# 生命周期
-# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if MEMORY_ENABLED:
@@ -133,9 +101,6 @@ app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-# ============================================================
-# 记忆注入
-# ============================================================
 async def build_system_prompt_with_memories(user_message: str) -> str:
     if not MEMORY_ENABLED:
         return SYSTEM_PROMPT
@@ -176,9 +141,6 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
         print(f"⚠️ 记忆检索失败: {e}，使用纯人设")
         return SYSTEM_PROMPT
 
-# ============================================================
-# 后台记忆处理
-# ============================================================
 async def process_memories_background(session_id: str, user_msg: str, assistant_msg: str, model: str, context_messages: list = None):
     global _round_counter
     try:
@@ -219,20 +181,13 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                 continue
             filtered_memories.append(mem)
         for mem in filtered_memories:
-            await save_memory(
-                content=mem["content"],
-                importance=mem["importance"],
-                source_session=session_id,
-            )
+            await save_memory(content=mem["content"], importance=mem["importance"], source_session=session_id)
         if filtered_memories:
             total = await get_all_memories_count()
             print(f"💾 已保存 {len(filtered_memories)} 条新记忆（过滤了 {len(new_memories) - len(filtered_memories)} 条），总计 {total} 条")
     except Exception as e:
         print(f"⚠️ 后台记忆处理失败: {e}")
 
-# ============================================================
-# API
-# ============================================================
 @app.get("/")
 async def health_check():
     memory_count = 0
@@ -272,7 +227,6 @@ async def chat_completions(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
 
-    # 提取用户最新消息
     user_message = ""
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -287,7 +241,6 @@ async def chat_completions(request: Request):
                 )
             break
 
-    # 构建 system prompt
     original_messages = [msg for msg in messages if msg.get("role") != "system"]
     if SYSTEM_PROMPT or (MEMORY_ENABLED and user_message):
         if MEMORY_ENABLED and user_message:
@@ -305,14 +258,12 @@ async def chat_completions(request: Request):
                 messages.insert(0, {"role": "system", "content": enhanced_prompt})
     body["messages"] = messages
 
-    # 模型处理 + 路由
     model = body.get("model", DEFAULT_MODEL) or DEFAULT_MODEL
-    model = resolve_model_alias(model)  # 映射到前缀模型
+    model = resolve_model_alias(model)
     body["model"] = model
 
     session_id = str(uuid.uuid4())[:8]
 
-    # 解析上游
     provider = resolve_provider(model)
     upstream_url = provider["base_url"]
     upstream_key = provider["api_key"]
@@ -339,7 +290,7 @@ async def chat_completions(request: Request):
         print(f"🧠 注入推理参数: reasoning_effort={REASONING_EFFORT}")
 
     print(f"📡 请求: model={model}, upstream_model={upstream_model}, stream={is_stream}, memory={'on' if MEMORY_ENABLED else 'off'}", flush=True)
-    body["model"] = upstream_model  # 上游使用真实模型名
+    body["model"] = upstream_model
 
     if is_stream:
         return StreamingResponse(
@@ -394,9 +345,6 @@ async def stream_and_capture(headers: dict, body: dict, session_id: str, user_me
             process_memories_background(session_id, user_message, assistant_msg, model, context_messages=original_messages)
         )
 
-# ============================================================
-# 记忆管理接口（保持原样）
-# ============================================================
 @app.get("/import/seed-memories")
 async def import_seed_memories():
     try:
@@ -548,7 +496,6 @@ async def import_memories(request: Request):
     except Exception as e:
         return {"error": str(e)}
 
-# ============================================================
 if __name__ == "__main__":
     import uvicorn
     print(f"🚀 AI Memory Gateway 启动中... 端口 {PORT}")
