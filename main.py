@@ -45,7 +45,7 @@ def resolve_provider(model_name: str):
             "api_key": os.environ[key_env],
             "model": real_model,
         }
-    # 默认上游（无前缀或未匹配）
+    # 默认上游
     return {
         "base_url": os.environ["API_BASE_URL"],
         "api_key": os.environ["API_KEY"],
