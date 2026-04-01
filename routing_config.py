@@ -15,7 +15,7 @@ PROVIDERS = {
     "yizi":   ("YIZI_BASE_URL",   "YIZI_API_KEY"),             # https://api.cetaceang.qzz.io/v1/chat/completions
     "paolu":  ("PAOLU_BASE_URL",  "PAOLU_API_KEY"),            # https://api.sillytaverns.com/v1/chat/completions
     "heabl":  ("HEABL_BASE_URL",  "HEABL_API_KEY"),            # https://api.heabl.top/v1/chat/completions
-    "ice":    ("ICE_BASE_URL",    "ICE_API_KEY"),              # https://ice.v.ua/v1
+    "ice":    ("ICE_BASE_URL",    "ICE_API_KEY"),              # https://ice.v.ua/v1/chat/completions
     # 继续加新站子就按这个格式
 }
 
