@@ -16,10 +16,12 @@ PROVIDERS = {
     "paolu":  ("PAOLU_BASE_URL",  "PAOLU_API_KEY"),            # https://api.sillytaverns.com/v1/chat/completions
     "heabl":  ("HEABL_BASE_URL",  "HEABL_API_KEY"),            # https://api.heabl.top/v1/chat/completions
     "ice":    ("ICE_BASE_URL",    "ICE_API_KEY"),              # https://ice.v.ua/v1/chat/completions
-    # 继续加新站子就按这个格式
+    "ekan":   ("EKAN_BASE_URL",   "EKAN_API_KEY"),             # https://api.ekan8.com/v1/chat/completions
+    "wong":   ("WONG_BASE_URL",   "WONG_API_KEY"),             # https://wzw.pp.ua/v1/chat/completions
+    # 新站子继续往下加："prefix": ("PREFIX_BASE_URL", "PREFIX_API_KEY"),
 }
 
-# 可选：无前缀默认路由（常用老模型），不想维护可不增新条目
+# 可选：无前缀时默认路由（常用老模型）
 MODEL_ROUTING = {
     "claude-opus-4-6-thinking": ("zhenhaoji", "claude-opus-4-6-thinking"),
     "claude-sonnet-4-5-20250929": ("zhenhaoji", "claude-sonnet-4-5-20250929"),
