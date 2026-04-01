@@ -3,22 +3,23 @@
 # 站子前缀 → (BASE_URL 环境变量名, API_KEY 环境变量名)
 PROVIDERS = {
     "zhenhaoji": ("ZHENHAOJI_BASE_URL", "ZHENHAOJI_API_KEY"),  # https://api.zhenhaoji.qzz.io/v1/chat/completions
-    "sunlea": ("SUNLEA_BASE_URL", "SUNLEA_API_KEY"),           # https://sunlea.de/v1/chat/completions
-    "fuka": ("FUKA_BASE_URL", "FUKA_API_KEY"),                 # https://api.fuka.win/v1/chat/completions
-    "qmbabyy": ("QMBABYY_BASE_URL", "QMBABYY_API_KEY"),        # https://qmbabyy.cn/v1/chat/completions
-    "newop": ("NEWOP_BASE_URL", "NEWOP_API_KEY"),
+    "sunlea":    ("SUNLEA_BASE_URL",    "SUNLEA_API_KEY"),     # https://sunlea.de/v1/chat/completions
+    "fuka":      ("FUKA_BASE_URL",      "FUKA_API_KEY"),       # https://api.fuka.win/v1/chat/completions
+    "qmbabyy":   ("QMBABYY_BASE_URL",   "QMBABYY_API_KEY"),    # https://qmbabyy.cn/v1/chat/completions
 
-    "ciwei": ("CIWEI_BASE_URL", "CIWEI_API_KEY"),              # https://cf-cc.cwapi.vip/v1
-    "sakura": ("SAKURA_BASE_URL", "SAKURA_API_KEY"),           # https://codex.sakurapy.de/v1
-    "pond": ("POND_BASE_URL", "POND_API_KEY"),                 # https://code.claudex.us.ci/v1
-    "ggboom": ("GGBOOM_BASE_URL", "GGBOOM_API_KEY"),           # https://ai.qaq.al/v1
-    "cups": ("CUPS_BASE_URL", "CUPS_API_KEY"),                 # https://free-llm.cups.moe/v1
-    "yizi": ("YIZI_BASE_URL", "YIZI_API_KEY"),                 # https://api.cetaceang.qzz.io/v1
-    "paolu": ("PAOLU_BASE_URL", "PAOLU_API_KEY"),              # https://api.sillytaverns.com/v1
-    "heabl": ("HEABL_BASE_URL", "HEABL_API_KEY"),              # https://api.heabl.top/v1
+    "ciwei":  ("CIWEI_BASE_URL",  "CIWEI_API_KEY"),            # https://cf-cc.cwapi.vip/v1/chat/completions
+    "sakura": ("SAKURA_BASE_URL", "SAKURA_API_KEY"),           # https://codex.sakurapy.de/v1/chat/completions
+    "pond":   ("POND_BASE_URL",   "POND_API_KEY"),             # https://code.claudex.us.ci/v1/chat/completions
+    "ggboom": ("GGBOOM_BASE_URL", "GGBOOM_API_KEY"),           # https://ai.qaq.al/v1/chat/completions
+    "cups":   ("CUPS_BASE_URL",   "CUPS_API_KEY"),             # https://free-llm.cups.moe/v1/chat/completions
+    "yizi":   ("YIZI_BASE_URL",   "YIZI_API_KEY"),             # https://api.cetaceang.qzz.io/v1/chat/completions
+    "paolu":  ("PAOLU_BASE_URL",  "PAOLU_API_KEY"),            # https://api.sillytaverns.com/v1/chat/completions
+    "heabl":  ("HEABL_BASE_URL",  "HEABL_API_KEY"),            # https://api.heabl.top/v1/chat/completions
+    "ice":    ("ICE_BASE_URL",    "ICE_API_KEY"),              # https://ice.v.ua/v1
+    # 继续加新站子就按这个格式
 }
 
-# 可选：无前缀时默认路由（常用老模型）
+# 可选：无前缀默认路由（常用老模型），不想维护可不增新条目
 MODEL_ROUTING = {
     "claude-opus-4-6-thinking": ("zhenhaoji", "claude-opus-4-6-thinking"),
     "claude-sonnet-4-5-20250929": ("zhenhaoji", "claude-sonnet-4-5-20250929"),
@@ -29,9 +30,8 @@ MODEL_ROUTING = {
 
 # 别名表：好记短名 / 同名共存
 MODEL_ALIASES = {
-    "sonnet-main": "zhenhaoji/claude-sonnet-4-6",
-    "sonnet-backup": "qmbabyy/claude-sonnet-4-6",
-    "opus-main": "zhenhaoji/claude-opus-4-6-thinking",
-    "opus-new":  "newop/claude-opus-4-6-thinking",
+    "sonnet-main":  "zhenhaoji/claude-sonnet-4-6",
+    "sonnet-backup":"qmbabyy/claude-sonnet-4-6",
+    "opus-main":    "zhenhaoji/claude-opus-4-6-thinking",
     # 需要短名再加："short": "prefix/real-model"
 }
