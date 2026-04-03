@@ -23,7 +23,7 @@ PROVIDERS = {
 
 # 可选：无前缀时默认路由（常用老模型）
 MODEL_ROUTING = {
-    "claude-opus-4-6-thinking": ("zhenhaoji", "claude-opus-4-6-thinking"),
+    "claude-opus-4-6-thinking": ("pond", "claude-opus-4-6-thinking"),
     "claude-sonnet-4-5-20250929": ("zhenhaoji", "claude-sonnet-4-5-20250929"),
     "claude-sonnet-4.5[假流式]": ("sunlea", "claude-sonnet-4.5[假流式]"),
     "[车厘子]claude-4.6-opus-thinking④": ("fuka", "[车厘子]claude-4.6-opus-thinking④"),
