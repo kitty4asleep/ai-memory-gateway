@@ -8,6 +8,7 @@ import asyncio
 import httpx
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
+from collections import deque
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -88,15 +89,23 @@ API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "anthropic/claude-sonnet-4")
 PORT = int(os.getenv("PORT", "8080"))
+
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
 MAX_MEMORIES_INJECT = int(os.getenv("MAX_MEMORIES_INJECT", "15"))
 MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
 TIMEZONE_HOURS = int(os.getenv("TIMEZONE_HOURS", "8"))
 _round_counter = 0
+
 FORCE_STREAM = os.getenv("FORCE_STREAM", "false").lower() == "true"
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "")
 EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://ai-memory-gateway.local")
 EXTRA_TITLE = os.getenv("EXTRA_TITLE", "AI Memory Gateway")
+
+# Debug 配置
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "")
+DEBUG_MAX_HISTORY = int(os.getenv("DEBUG_MAX_HISTORY", "20"))
+DEBUG_MAX_CONTENT_LEN = int(os.getenv("DEBUG_MAX_CONTENT_LEN", "3000"))
 
 
 def load_system_prompt():
@@ -119,6 +128,77 @@ else:
     print("ℹ️ 无人设，纯转发模式")
 
 
+# ============================================================
+# Debug 快照存储
+# ============================================================
+LATEST_DEBUG_SNAPSHOT = {
+    "updated_at": None,
+    "session_id": None,
+    "model_requested": None,
+    "model_upstream": None,
+    "upstream_url": None,
+    "is_stream": None,
+    "headers": {},
+    "messages": [],
+}
+
+DEBUG_HISTORY = deque(maxlen=DEBUG_MAX_HISTORY)
+
+
+def _mask_headers_for_debug(headers: dict):
+    safe = dict(headers or {})
+    if "Authorization" in safe:
+        safe["Authorization"] = "Bearer ***"
+    return safe
+
+
+def _sanitize_messages_for_debug(messages: list):
+    sanitized = []
+    for m in messages or []:
+        role = m.get("role")
+        content = m.get("content", "")
+        if isinstance(content, str) and len(content) > DEBUG_MAX_CONTENT_LEN:
+            content = content[:DEBUG_MAX_CONTENT_LEN] + "...[TRUNCATED]"
+        sanitized.append({
+            "role": role,
+            "content": content
+        })
+    return sanitized
+
+
+def _record_debug_snapshot(
+    session_id: str,
+    model_requested: str,
+    model_upstream: str,
+    upstream_url: str,
+    is_stream: bool,
+    headers: dict,
+    final_messages: list
+):
+    snap = {
+        "updated_at": datetime.now().isoformat(),
+        "session_id": session_id,
+        "model_requested": model_requested,
+        "model_upstream": model_upstream,
+        "upstream_url": upstream_url,
+        "is_stream": is_stream,
+        "headers": _mask_headers_for_debug(headers),
+        "messages": _sanitize_messages_for_debug(final_messages),
+    }
+
+    LATEST_DEBUG_SNAPSHOT.update(snap)
+    DEBUG_HISTORY.appendleft(snap)
+
+
+def _check_debug_auth(request: Request):
+    if not DEBUG_MODE:
+        return JSONResponse(status_code=403, content={"error": "DEBUG_MODE is disabled"})
+    token = request.headers.get("X-Debug-Token", "")
+    if not DEBUG_TOKEN or token != DEBUG_TOKEN:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if MEMORY_ENABLED:
@@ -136,7 +216,7 @@ async def lifespan(app: FastAPI):
         await close_pool()
 
 
-app = FastAPI(title="AI Memory Gateway", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="AI Memory Gateway", version="2.1.0-debug", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -254,12 +334,13 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "AI Memory Gateway v2.0",
+        "gateway": "AI Memory Gateway v2.1.0-debug",
         "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
         "system_prompt_length": len(SYSTEM_PROMPT),
         "memory_enabled": MEMORY_ENABLED,
         "memory_count": memory_count,
         "memory_extract_interval": MEMORY_EXTRACT_INTERVAL,
+        "debug_mode": DEBUG_MODE,
     }
 
 
@@ -353,6 +434,18 @@ async def chat_completions(request: Request):
 
     body["model"] = upstream_model
 
+    # 记录 debug 快照
+    if DEBUG_MODE:
+        _record_debug_snapshot(
+            session_id=session_id,
+            model_requested=model,
+            model_upstream=upstream_model,
+            upstream_url=upstream_url,
+            is_stream=is_stream,
+            headers=headers,
+            final_messages=body.get("messages", []),
+        )
+
     if is_stream:
         return StreamingResponse(
             stream_and_capture(
@@ -431,6 +524,29 @@ async def stream_and_capture(
                 context_messages=original_messages
             )
         )
+
+
+# ============================================================
+# Debug Endpoints
+# ============================================================
+@app.get("/debug/last-request")
+async def debug_last_request(request: Request):
+    auth_err = _check_debug_auth(request)
+    if auth_err:
+        return auth_err
+    return {"status": "ok", "snapshot": LATEST_DEBUG_SNAPSHOT}
+
+
+@app.get("/debug/recent-requests")
+async def debug_recent_requests(request: Request):
+    auth_err = _check_debug_auth(request)
+    if auth_err:
+        return auth_err
+    return {
+        "status": "ok",
+        "count": len(DEBUG_HISTORY),
+        "items": list(DEBUG_HISTORY),
+    }
 
 
 @app.get("/import/seed-memories")
@@ -621,4 +737,6 @@ if __name__ == "__main__":
         print("⚡ 强制流式传输：开启")
     if REASONING_EFFORT:
         print(f"🧠 推理参数注入：{REASONING_EFFORT}")
+    if DEBUG_MODE:
+        print(f"🛠️ DEBUG_MODE：开启，历史条数上限={DEBUG_MAX_HISTORY}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
