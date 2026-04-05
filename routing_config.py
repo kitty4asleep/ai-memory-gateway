@@ -6,7 +6,8 @@ PROVIDERS = {
     "sunlea":    ("SUNLEA_BASE_URL",    "SUNLEA_API_KEY"),     # https://sunlea.de/v1/chat/completions
     "fuka":      ("FUKA_BASE_URL",      "FUKA_API_KEY"),       # https://api.fuka.win/v1/chat/completions
     "qmbabyy":   ("QMBABYY_BASE_URL",   "QMBABYY_API_KEY"),    # https://qmbabyy.cn/v1/chat/completions
-
+ 
+    "RUN":    ("RUN_BASE_URL",    "RUN_API_KEY"),              # https://runanytime.hxi.me/v1/chat/completions
     "zyra":  ("ZYRA_BASE_URL",  "ZYRA_API_KEY"),               # https://zyraonline.org/v1/chat/completions
     "ciwei":  ("CIWEI_BASE_URL",  "CIWEI_API_KEY"),            # https://cf-cc.cwapi.vip/v1/chat/completions
     "sakura": ("SAKURA_BASE_URL", "SAKURA_API_KEY"),           # https://codex.sakurapy.de/v1/chat/completions
