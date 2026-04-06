@@ -22,11 +22,9 @@ from database import (
 )
 from memory_extractor import extract_memories, score_memories
 
-# 路由配置（以后只改 routing_config.py）
 from routing_config import PROVIDERS, MODEL_ROUTING, MODEL_ALIASES
 
 
-# ==== 工具：别名解析 / 上游路由 ====
 def resolve_model_alias(raw_model: str):
     if raw_model in MODEL_ALIASES:
         raw_model = MODEL_ALIASES[raw_model]
@@ -45,20 +43,18 @@ def resolve_provider(model_name: str):
     if prefix and prefix in PROVIDERS:
         base_env, key_env = PROVIDERS[prefix]
         return {
-            "base_url": os.environ[base_env],
-            "api_key": os.environ[key_env],
+            "base_url": os.environ.get(base_env, ""),
+            "api_key": os.environ.get(key_env, ""),
             "model": real_model,
         }
 
-    # 默认上游
     return {
-        "base_url": os.environ["API_BASE_URL"],
-        "api_key": os.environ["API_KEY"],
+        "base_url": os.environ.get("API_BASE_URL", ""),
+        "api_key": os.environ.get("API_KEY", ""),
         "model": model_name,
     }
 
 
-# ==== 工具：上下文截断防巨长账单 ====
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "8000"))
 
 def trim_messages_by_chars(messages, limit=MAX_PROMPT_CHARS):
@@ -82,9 +78,6 @@ def trim_messages_by_chars(messages, limit=MAX_PROMPT_CHARS):
     return system_msgs + kept_other
 
 
-# ============================================================
-# 配置项
-# ============================================================
 API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "anthropic/claude-sonnet-4")
@@ -101,7 +94,6 @@ REASONING_EFFORT = os.getenv("REASONING_EFFORT", "")
 EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://ai-memory-gateway.local")
 EXTRA_TITLE = os.getenv("EXTRA_TITLE", "AI Memory Gateway")
 
-# Debug 配置
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "")
 DEBUG_MAX_HISTORY = int(os.getenv("DEBUG_MAX_HISTORY", "20"))
@@ -128,9 +120,6 @@ else:
     print("ℹ️ 无人设，纯转发模式")
 
 
-# ============================================================
-# Debug 快照存储
-# ============================================================
 LATEST_DEBUG_SNAPSHOT = {
     "updated_at": None,
     "session_id": None,
@@ -216,7 +205,7 @@ async def lifespan(app: FastAPI):
         await close_pool()
 
 
-app = FastAPI(title="AI Memory Gateway", version="2.1.0-debug", lifespan=lifespan)
+app = FastAPI(title="AI Memory Gateway", version="2.1.1-debug-fix", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -334,7 +323,7 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "AI Memory Gateway v2.1.0-debug",
+        "gateway": "AI Memory Gateway v2.1.1-debug-fix",
         "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
         "system_prompt_length": len(SYSTEM_PROMPT),
         "memory_enabled": MEMORY_ENABLED,
@@ -361,13 +350,9 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    if not API_KEY:
-        return JSONResponse(status_code=500, content={"error": "API_KEY 未设置，请在环境变量中配置"})
-
     body = await request.json()
     messages = body.get("messages", [])
 
-    # 提取用户最新消息
     user_message = ""
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -384,7 +369,6 @@ async def chat_completions(request: Request):
 
     original_messages = [msg for msg in messages if msg.get("role") != "system"]
 
-    # 构建网关注入 system（独立插入，不覆盖前端 system）
     enhanced = ""
     if MEMORY_ENABLED and user_message:
         enhanced = await build_system_prompt_with_memories(user_message)
@@ -394,21 +378,30 @@ async def chat_completions(request: Request):
     if enhanced and enhanced.strip():
         messages.insert(0, {"role": "system", "content": enhanced})
 
-    # 截断上下文（保留全部 system）
     body["messages"] = trim_messages_by_chars(messages, MAX_PROMPT_CHARS)
 
-    # 模型解析
     model = body.get("model", DEFAULT_MODEL) or DEFAULT_MODEL
     model = resolve_model_alias(model)
     body["model"] = model
 
     session_id = str(uuid.uuid4())[:8]
 
-    # 上游路由
     provider = resolve_provider(model)
     upstream_url = provider["base_url"]
     upstream_key = provider["api_key"]
     upstream_model = provider["model"]
+
+    if not upstream_url:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"上游 BASE_URL 未设置：model={model}"}
+        )
+
+    if not upstream_key:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"上游 API Key 未设置：model={model}, upstream={upstream_url}"}
+        )
 
     headers = {
         "Authorization": f"Bearer {upstream_key}",
@@ -434,7 +427,6 @@ async def chat_completions(request: Request):
 
     body["model"] = upstream_model
 
-    # 记录 debug 快照
     if DEBUG_MODE:
         _record_debug_snapshot(
             session_id=session_id,
@@ -526,9 +518,6 @@ async def stream_and_capture(
         )
 
 
-# ============================================================
-# Debug Endpoints
-# ============================================================
 @app.get("/debug/last-request")
 async def debug_last_request(request: Request):
     auth_err = _check_debug_auth(request)
