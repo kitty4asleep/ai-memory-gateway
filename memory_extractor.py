@@ -6,10 +6,10 @@
 每次对话结束后，把最近的对话内容发给一个便宜的模型，
 让它提取出值得长期记住的信息，存到数据库里。
 
-v2.4 改进：
+v2.4 修复版：
 1. 提取时注入已有记忆，让模型对比后只提取全新信息
 2. 强化 importance 评分规则，减少分数漂移
-3. 更强调长期价值、未来复用价值、关系重要性
+3. 修复 .format() 与 JSON 花括号冲突的问题
 """
 
 import os
@@ -69,20 +69,20 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 # importance 评分规则（1-10）
 请严格按照以下标准打分：
 
-- 9-10：核心且长期稳定的信息  
-  例如：身份信息、年龄、生日、重要关系、长期目标、明确禁忌、长期沟通规则、核心项目主线、持续性关系定位
+- 9-10：核心且长期稳定的信息
+例如：身份信息、年龄、生日、重要关系、长期目标、明确禁忌、长期沟通规则、核心项目主线、持续性关系定位
 
-- 7-8：重要且未来高概率复用的信息  
-  例如：重要偏好、重大事件、持续性的情感需求、重要项目进展、关系中的关键约定、稳定使用习惯
+- 7-8：重要且未来高概率复用的信息
+例如：重要偏好、重大事件、持续性的情感需求、重要项目进展、关系中的关键约定、稳定使用习惯
 
-- 5-6：中等重要、未来可能会用到的信息  
-  例如：一般生活习惯、普通偏好、阶段性安排、近期状态、常规日常信息
+- 5-6：中等重要、未来可能会用到的信息
+例如：一般生活习惯、普通偏好、阶段性安排、近期状态、常规日常信息
 
-- 3-4：短期状态、一次性提及、低复用信息  
-  例如：临时情绪、偶然提及的小事、短期计划、轻量生活碎片
+- 3-4：短期状态、一次性提及、低复用信息
+例如：临时情绪、偶然提及的小事、短期计划、轻量生活碎片
 
-- 1-2：琐碎、低价值、几乎不影响未来对话的信息  
-  这类信息通常不应提取；除非有特殊意义，否则宁可不返回
+- 1-2：琐碎、低价值、几乎不影响未来对话的信息
+这类信息通常不应提取；除非有特殊意义，否则宁可不返回
 
 # 评分原则
 评分时优先考虑以下维度：
@@ -95,8 +95,8 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 # 输出格式
 请用以下 JSON 格式返回（不要包含其他内容）：
 [
-  {"content": "记忆内容", "importance": 分数},
-  {"content": "记忆内容", "importance": 分数}
+  {{"content": "记忆内容", "importance": 8}},
+  {{"content": "记忆内容", "importance": 6}}
 ]
 
 要求：
@@ -125,7 +125,6 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     if not messages:
         return []
 
-    # 把对话格式化成文本
     conversation_text = ""
     for msg in messages:
         role = msg.get("role", "unknown")
@@ -138,16 +137,13 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     if not conversation_text.strip():
         return []
 
-    # 格式化已有记忆
     if existing_memories:
         memories_text = "\n".join(f"- {m}" for m in existing_memories)
     else:
         memories_text = "（暂无已知信息）"
 
-    # 把已有记忆填入 prompt
     prompt = EXTRACTION_PROMPT.format(existing_memories=memories_text)
 
-    # 调用 LLM 提取记忆
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
@@ -176,10 +172,8 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
             data = response.json()
             text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-            # 打印模型原始返回（截断防刷屏）
             print(f"📝 记忆模型原始返回:\n{text[:500]}", flush=True)
 
-            # 清理可能的 markdown 格式
             text = text.strip()
             if text.startswith("```json"):
                 text = text[7:]
@@ -189,7 +183,6 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                 text = text[:-3]
             text = text.strip()
 
-            # 强力 JSON 提取：如果上面清理后仍然解析失败，用正则兜底
             try:
                 memories = json.loads(text)
             except json.JSONDecodeError:
@@ -209,7 +202,6 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
             if not isinstance(memories, list):
                 return []
 
-            # 验证格式 + importance 夹紧
             valid_memories = []
             for mem in memories:
                 if isinstance(mem, dict) and "content" in mem:
@@ -289,7 +281,6 @@ async def score_memories(texts: List[str]) -> List[Dict]:
 
             if response.status_code != 200:
                 print(f"⚠️ 记忆评分请求失败: {response.status_code}")
-                # 失败时返回默认分数
                 return [{"content": t, "importance": 5} for t in texts]
 
             data = response.json()
