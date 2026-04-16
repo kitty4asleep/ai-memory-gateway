@@ -1,17 +1,17 @@
 """
-记忆提取模块 —— 用 LLM 从对话中提炼关键记忆
-=============================================
+记忆提取模块 —— 用 LLM 从对话或现有文本中提炼结构化记忆
+======================================================
 
-每次对话结束后，把最近的对话内容发给一个便宜的模型，
-让它提取出值得长期记住的信息，存到数据库里。
+能力：
+1. 从对话中提取新记忆
+2. 对纯文本记忆进行自动评分
+3. 对导入/旧记忆做完整结构化分类（importance + memory_type + resolved + valence + arousal + project）
 
-v2.6 融合版：
-1. 提取时注入已有记忆，让模型对比后只提取全新信息
-2. 强化 importance 评分规则，减少分数漂移
-3. 修复 .format() 与 JSON 花括号冲突的问题
-4. 支持结构化记忆字段：memory_type / resolved / valence / arousal / project
-5. 增强 404/非200 排错日志
-6. 显式使用 certifi 证书包
+v2.7 导入重判版：
+- 支持导入时完整 AI 结构化
+- 支持旧记忆批量重分类
+- 显式使用 certifi
+- 增强非200错误日志
 """
 
 import os
@@ -25,9 +25,13 @@ import certifi
 
 API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
-
-# 用来提取记忆的模型（便宜的就行）
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "anthropic/claude-haiku-4")
+
+
+ALLOWED_MEMORY_TYPES = {
+    "identity", "preference", "relationship", "rule",
+    "project", "event", "issue", "todo", "emotion_event"
+}
 
 
 EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提取值得长期记住的关键信息。
@@ -74,22 +78,11 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 - 如果对话中没有任何新信息，返回空数组 []
 
 # importance 评分规则（1-10）
-请严格按照以下标准打分：
-
 - 9-10：核心且长期稳定的信息
-  例如：身份信息、年龄、生日、重要关系、长期目标、明确禁忌、长期沟通规则、核心项目主线、持续性关系定位
-
 - 7-8：重要且未来高概率复用的信息
-  例如：重要偏好、重大事件、持续性的情感需求、重要项目进展、关系中的关键约定、稳定使用习惯、长期未解决问题
-
 - 5-6：中等重要、未来可能会用到的信息
-  例如：一般生活习惯、普通偏好、阶段性安排、近期状态、常规日常信息、阶段性问题
-
 - 3-4：短期状态、一次性提及、低复用信息
-  例如：临时情绪、偶然提及的小事、短期计划、轻量生活碎片
-
 - 1-2：琐碎、低价值、几乎不影响未来对话的信息
-  这类信息通常不应提取；除非有特殊意义，否则宁可不返回
 
 # memory_type 取值规则
 只能使用以下枚举值之一：
@@ -103,17 +96,6 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 - todo
 - emotion_event
 
-说明：
-- identity：稳定身份事实
-- preference：长期偏好
-- relationship：关系动态、称呼、互动定位
-- rule：长期沟通规则、禁忌、使用规则
-- project：持续中的项目、长期计划
-- event：普通事件
-- issue：未解决问题、长期卡点
-- todo：明确下一步、待办、后续行动
-- emotion_event：高情绪强度事件
-
 # resolved 规则
 - 对 issue / todo / project，如果明显已经解决，可以设为 true
 - 如果仍未解决或未来还要继续跟进，设为 false
@@ -121,23 +103,10 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 
 # valence / arousal 规则
 - valence：情绪效价，范围 -1 到 1
-  - 负向：-1 接近强烈负面
-  - 中性：0
-  - 正向：1 接近强烈正面
-
 - arousal：情绪强度，范围 0 到 1
-  - 0 接近平静、低波动
-  - 1 接近强烈、激烈、难忘
-
-如果不是明显情绪性记忆，可给较保守数值，例如：
-- valence = 0
-- arousal = 0.2
 
 # project 字段
-- 如果该记忆明显属于某个长期项目，填项目名，例如：
-  "memory-gateway"
-  "sillytavern"
-  "termux"
+- 如果该记忆明显属于某个长期项目，填项目名
 - 否则填空字符串 ""
 
 # 输出格式
@@ -172,17 +141,100 @@ SCORING_PROMPT = """你是记忆重要性评分专家。请对以下记忆条目
 - 3-4：临时状态、偶然提及、低复用信息
 - 1-2：琐碎信息、几乎不会影响未来对话的信息
 
-# 评分原则
-优先考虑长期价值、未来复用价值、关系重要性、一致性需求。
-
-# 输入记忆
-{memories_text}
-
 # 输出格式
 返回 JSON 数组，每条包含原文和评分：
 [{{"content": "原文", "importance": 评分数字}}]
 
 只返回 JSON，不要其他文字。
+
+# 输入记忆
+{memories_text}
+"""
+
+
+CLASSIFY_IMPORT_PROMPT = """你是长期记忆结构化整理专家。
+
+我会给你一批已经存在的记忆文本。你的任务不是提取新记忆，而是对这些已有记忆逐条做结构化标注。
+
+你必须为每条记忆判断以下字段：
+- importance（1-10）
+- memory_type
+- resolved
+- valence（-1 到 1）
+- arousal（0 到 1）
+- project（无则空字符串）
+
+# memory_type 只能使用以下值之一
+- identity
+- preference
+- relationship
+- rule
+- project
+- event
+- issue
+- todo
+- emotion_event
+
+# 判断原则
+
+## importance
+- 9-10：核心且长期稳定
+- 7-8：重要且高复用
+- 5-6：中等重要
+- 3-4：短期/低复用
+- 1-2：琐碎
+
+## resolved
+- 如果内容描述的是已完成、已解决、已过去且不再悬而未决的事项，可设 true
+- 如果是仍在持续、待继续、未解决的问题或计划，设 false
+- 拿不准时默认 false
+
+## valence
+- -1 到 1
+- 负面更低，正面更高，中性为 0
+
+## arousal
+- 0 到 1
+- 越强烈、越重要、越情绪化，越高
+
+## project
+- 如果明显属于长期项目，填项目名，例如：
+  - memory-gateway
+  - sillytavern
+  - termux
+- 否则填空字符串 ""
+
+# 输出要求
+- 输出 JSON 数组
+- 数组长度必须与输入条目数量一致
+- 每条都保留原始 content
+- 不要输出解释
+- 不要 markdown 代码块
+
+输出格式示例：
+[
+  {{
+    "content": "原文A",
+    "importance": 8,
+    "memory_type": "project",
+    "resolved": false,
+    "valence": 0.1,
+    "arousal": 0.4,
+    "project": "memory-gateway"
+  }},
+  {{
+    "content": "原文B",
+    "importance": 6,
+    "memory_type": "preference",
+    "resolved": false,
+    "valence": 0.3,
+    "arousal": 0.2,
+    "project": ""
+  }}
+]
+
+# 输入记忆
+{memories_text}
 """
 
 
@@ -207,17 +259,84 @@ def _extract_json_array(text: str):
         raise
 
 
+def _normalize_memory_item(mem: dict) -> dict | None:
+    if not isinstance(mem, dict) or "content" not in mem:
+        return None
+
+    content = str(mem.get("content", "")).strip()
+    if not content:
+        return None
+
+    try:
+        importance = int(mem.get("importance", 5))
+    except Exception:
+        importance = 5
+    importance = max(1, min(10, importance))
+
+    memory_type = str(mem.get("memory_type", "event")).strip() or "event"
+    if memory_type not in ALLOWED_MEMORY_TYPES:
+        memory_type = "event"
+
+    resolved = bool(mem.get("resolved", False))
+
+    try:
+        valence = float(mem.get("valence")) if mem.get("valence") is not None else None
+        if valence is not None:
+            valence = max(-1.0, min(1.0, valence))
+    except Exception:
+        valence = None
+
+    try:
+        arousal = float(mem.get("arousal")) if mem.get("arousal") is not None else None
+        if arousal is not None:
+            arousal = max(0.0, min(1.0, arousal))
+    except Exception:
+        arousal = None
+
+    project = str(mem.get("project", "")).strip() or None
+
+    return {
+        "content": content,
+        "importance": importance,
+        "memory_type": memory_type,
+        "resolved": resolved,
+        "valence": valence,
+        "arousal": arousal,
+        "project": project,
+    }
+
+
+async def _post_to_memory_model(messages: list, max_tokens: int = 1600):
+    if not API_KEY:
+        raise RuntimeError("API_KEY 未设置")
+
+    async with httpx.AsyncClient(timeout=60, verify=certifi.where()) as client:
+        response = await client.post(
+            API_BASE_URL,
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://midsummer-gateway.local",
+                "X-Title": "Midsummer Memory Extraction",
+            },
+            json={
+                "model": MEMORY_MODEL,
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "messages": messages,
+            },
+        )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"status={response.status_code}, url={API_BASE_URL}, model={MEMORY_MODEL}, body={response.text[:1000]}"
+        )
+
+    data = response.json()
+    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+
 async def extract_memories(messages: List[Dict[str, str]], existing_memories: List[str] = None) -> List[Dict]:
-    """
-    从对话消息中提取记忆
-
-    参数：
-        messages: 对话消息列表，格式 [{"role": "user", "content": "..."}, ...]
-        existing_memories: 已有记忆内容列表，用于去重对比
-
-    返回：
-        结构化记忆列表
-    """
     if not API_KEY:
         print("⚠️ API_KEY 未设置，跳过记忆提取", flush=True)
         return []
@@ -229,7 +348,6 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     for msg in messages:
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
-
         if role == "user":
             conversation_text += f"用户: {content}\n"
         elif role == "assistant":
@@ -252,106 +370,31 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     )
 
     try:
-        async with httpx.AsyncClient(timeout=60, verify=certifi.where()) as client:
-            response = await client.post(
-                API_BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://midsummer-gateway.local",
-                    "X-Title": "Midsummer Memory Extraction",
-                },
-                json={
-                    "model": MEMORY_MODEL,
-                    "max_tokens": 1600,
-                    "temperature": 0,
-                    "messages": [
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
-                    ],
-                },
-            )
+        text = await _post_to_memory_model(
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
+            ],
+            max_tokens=1600,
+        )
 
-            if response.status_code != 200:
-                print(
-                    f"⚠️ 记忆提取请求失败: status={response.status_code}, "
-                    f"url={API_BASE_URL}, model={MEMORY_MODEL}, "
-                    f"body={response.text[:1000]}",
-                    flush=True
-                )
-                return []
+        print(f"📝 记忆模型原始返回:\n{text[:1000]}", flush=True)
 
-            data = response.json()
-            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        memories = _extract_json_array(text)
+        if not isinstance(memories, list):
+            return []
 
-            print(f"📝 记忆模型原始返回:\n{text[:1000]}", flush=True)
+        valid_memories = []
+        for mem in memories:
+            normalized = _normalize_memory_item(mem)
+            if normalized:
+                valid_memories.append(normalized)
 
-            try:
-                memories = _extract_json_array(text)
-            except Exception as e:
-                print(f"⚠️ 记忆提取结果解析失败: {e}", flush=True)
-                return []
-
-            if not isinstance(memories, list):
-                return []
-
-            valid_memories = []
-            allowed_types = {
-                "identity", "preference", "relationship", "rule",
-                "project", "event", "issue", "todo", "emotion_event"
-            }
-
-            for mem in memories:
-                if not isinstance(mem, dict) or "content" not in mem:
-                    continue
-
-                content = str(mem["content"]).strip()
-                if not content:
-                    continue
-
-                try:
-                    importance = int(mem.get("importance", 5))
-                except Exception:
-                    importance = 5
-                importance = max(1, min(10, importance))
-
-                memory_type = str(mem.get("memory_type", "event")).strip() or "event"
-                if memory_type not in allowed_types:
-                    memory_type = "event"
-
-                resolved = bool(mem.get("resolved", False))
-
-                try:
-                    valence = float(mem.get("valence")) if mem.get("valence") is not None else None
-                    if valence is not None:
-                        valence = max(-1.0, min(1.0, valence))
-                except Exception:
-                    valence = None
-
-                try:
-                    arousal = float(mem.get("arousal")) if mem.get("arousal") is not None else None
-                    if arousal is not None:
-                        arousal = max(0.0, min(1.0, arousal))
-                except Exception:
-                    arousal = None
-
-                project = str(mem.get("project", "")).strip() or None
-
-                valid_memories.append({
-                    "content": content,
-                    "importance": importance,
-                    "memory_type": memory_type,
-                    "resolved": resolved,
-                    "valence": valence,
-                    "arousal": arousal,
-                    "project": project,
-                })
-
-            print(
-                f"📝 从对话中提取了 {len(valid_memories)} 条新记忆（已对比 {len(existing_memories or [])} 条已有记忆）",
-                flush=True
-            )
-            return valid_memories
+        print(
+            f"📝 从对话中提取了 {len(valid_memories)} 条新记忆（已对比 {len(existing_memories or [])} 条已有记忆）",
+            flush=True
+        )
+        return valid_memories
 
     except Exception as e:
         print(f"⚠️ 记忆提取出错: {type(e).__name__}: {e}", flush=True)
@@ -359,7 +402,6 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
 
 
 async def score_memories(texts: List[str]) -> List[Dict]:
-    """对纯文本记忆条目批量评分"""
     if not texts:
         return []
 
@@ -372,62 +414,120 @@ async def score_memories(texts: List[str]) -> List[Dict]:
     )
 
     try:
-        async with httpx.AsyncClient(timeout=60, verify=certifi.where()) as client:
-            response = await client.post(
-                API_BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": MEMORY_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0,
-                    "max_tokens": 4000,
-                },
-            )
+        text = await _post_to_memory_model(
+            [{"role": "user", "content": prompt}],
+            max_tokens=4000,
+        )
 
-            if response.status_code != 200:
-                print(
-                    f"⚠️ 记忆评分请求失败: status={response.status_code}, "
-                    f"url={API_BASE_URL}, model={MEMORY_MODEL}, "
-                    f"body={response.text[:1000]}",
-                    flush=True
-                )
-                return [{"content": t, "importance": 5} for t in texts]
+        memories = _extract_json_array(text)
+        if not isinstance(memories, list):
+            return [{"content": t, "importance": 5} for t in texts]
 
-            data = response.json()
-            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        valid = []
+        for mem in memories:
+            if isinstance(mem, dict) and "content" in mem:
+                content = str(mem["content"]).strip()
+                if not content:
+                    continue
+                try:
+                    importance = int(mem.get("importance", 5))
+                except Exception:
+                    importance = 5
+                importance = max(1, min(10, importance))
+                valid.append({
+                    "content": content,
+                    "importance": importance,
+                })
 
-            try:
-                memories = _extract_json_array(text)
-            except Exception:
-                return [{"content": t, "importance": 5} for t in texts]
-
-            if not isinstance(memories, list):
-                return [{"content": t, "importance": 5} for t in texts]
-
-            valid = []
-            for mem in memories:
-                if isinstance(mem, dict) and "content" in mem:
-                    content = str(mem["content"]).strip()
-                    if not content:
-                        continue
-
-                    try:
-                        importance = int(mem.get("importance", 5))
-                    except Exception:
-                        importance = 5
-                    importance = max(1, min(10, importance))
-
-                    valid.append({
-                        "content": content,
-                        "importance": importance,
-                    })
-
-            print(f"📝 为 {len(valid)} 条记忆完成自动评分", flush=True)
-            return valid
+        print(f"📝 为 {len(valid)} 条记忆完成自动评分", flush=True)
+        return valid
 
     except Exception as e:
         print(f"⚠️ 记忆评分出错: {type(e).__name__}: {e}", flush=True)
         return [{"content": t, "importance": 5} for t in texts]
+
+
+async def classify_memory_texts(texts: List[str]) -> List[Dict]:
+    """
+    对已有记忆文本做完整结构化分类。
+    用于：
+    - 导入时自动重判
+    - 旧记忆重建
+    """
+    if not texts:
+        return []
+
+    if not API_KEY:
+        print("⚠️ API_KEY 未设置，无法进行结构化分类，退回默认值", flush=True)
+        return [
+            {
+                "content": t,
+                "importance": 5,
+                "memory_type": "event",
+                "resolved": False,
+                "valence": 0.0,
+                "arousal": 0.2,
+                "project": None,
+            }
+            for t in texts
+        ]
+
+    memories_text = "\n".join(f"- {t}" for t in texts)
+
+    print(
+        f"🧠 开始结构化分类: model={MEMORY_MODEL}, url={API_BASE_URL}, count={len(texts)}",
+        flush=True
+    )
+
+    try:
+        prompt = CLASSIFY_IMPORT_PROMPT.format(memories_text=memories_text)
+
+        text = await _post_to_memory_model(
+            [{"role": "user", "content": prompt}],
+            max_tokens=4000,
+        )
+
+        print(f"📝 结构化分类原始返回:\n{text[:1200]}", flush=True)
+
+        memories = _extract_json_array(text)
+        if not isinstance(memories, list):
+            raise ValueError("返回结果不是 JSON 数组")
+
+        valid = []
+        for mem in memories:
+            normalized = _normalize_memory_item(mem)
+            if normalized:
+                valid.append(normalized)
+
+        # 如果模型返回条数不一致，尽量兜底补齐
+        if len(valid) < len(texts):
+            existing_contents = {m["content"] for m in valid}
+            for t in texts:
+                if t not in existing_contents:
+                    valid.append({
+                        "content": t,
+                        "importance": 5,
+                        "memory_type": "event",
+                        "resolved": False,
+                        "valence": 0.0,
+                        "arousal": 0.2,
+                        "project": None,
+                    })
+
+        print(f"📝 完成结构化分类 {len(valid)} 条", flush=True)
+        return valid
+
+    except Exception as e:
+        print(f"⚠️ 结构化分类失败: {type(e).__name__}: {e}", flush=True)
+        return [
+            {
+                "content": t,
+                "importance": 5,
+                "memory_type": "event",
+                "resolved": False,
+                "valence": 0.0,
+                "arousal": 0.2,
+                "project": None,
+            }
+            for t in texts
+        ]
