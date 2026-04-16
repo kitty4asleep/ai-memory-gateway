@@ -1,27 +1,38 @@
 """
 AI Memory Gateway — 带记忆系统的 LLM 转发网关
 """
+
 import os
 import json
 import uuid
 import asyncio
-import httpx
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from collections import deque
+
+import httpx
+import certifi
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from database import (
-    init_tables, close_pool, save_message, search_memories, save_memory,
-    get_all_memories_count, get_recent_memories, get_all_memories,
-    get_pool, get_all_memories_detail, update_memory, delete_memory,
-    delete_memories_batch
+    init_tables,
+    close_pool,
+    save_message,
+    search_memories,
+    save_memory,
+    get_all_memories_count,
+    get_recent_memories,
+    get_all_memories,
+    get_pool,
+    get_all_memories_detail,
+    update_memory,
+    delete_memory,
+    delete_memories_batch,
 )
 from memory_extractor import extract_memories, score_memories
-
 from routing_config import PROVIDERS, MODEL_ROUTING, MODEL_ALIASES
 
 
@@ -56,6 +67,7 @@ def resolve_provider(model_name: str):
 
 
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "8000"))
+
 
 def trim_messages_by_chars(messages, limit=MAX_PROMPT_CHARS):
     """
@@ -109,6 +121,7 @@ def load_system_prompt():
                 return content
     except FileNotFoundError:
         pass
+
     print("ℹ️ 未找到 system_prompt.txt 或文件为空，将不注入 system prompt")
     return ""
 
@@ -130,7 +143,6 @@ LATEST_DEBUG_SNAPSHOT = {
     "headers": {},
     "messages": [],
 }
-
 DEBUG_HISTORY = deque(maxlen=DEBUG_MAX_HISTORY)
 
 
@@ -174,7 +186,6 @@ def _record_debug_snapshot(
         "headers": _mask_headers_for_debug(headers),
         "messages": _sanitize_messages_for_debug(final_messages),
     }
-
     LATEST_DEBUG_SNAPSHOT.update(snap)
     DEBUG_HISTORY.appendleft(snap)
 
@@ -200,12 +211,14 @@ async def lifespan(app: FastAPI):
             print("⚠️ 记忆系统将不可用，但网关仍可正常转发")
     else:
         print("ℹ️ 记忆系统已关闭（设置 MEMORY_ENABLED=true 开启）")
+
     yield
+
     if MEMORY_ENABLED:
         await close_pool()
 
 
-app = FastAPI(title="AI Memory Gateway", version="2.1.1-debug-fix", lifespan=lifespan)
+app = FastAPI(title="AI Memory Gateway", version="2.6.0-v2-lite", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -213,6 +226,7 @@ templates = Jinja2Templates(directory="templates")
 async def build_system_prompt_with_memories(user_message: str) -> str:
     if not MEMORY_ENABLED:
         return SYSTEM_PROMPT
+
     try:
         memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
         if not memories:
@@ -229,20 +243,39 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
                     date_str = f"[{local_dt.strftime('%Y-%m-%d')}] "
                 except Exception:
                     date_str = f"[{str(mem['created_at'])[:10]}] "
-            memory_lines.append(f"- {date_str}{mem['content']}")
+
+            extra = []
+            if mem.get("memory_type"):
+                extra.append(f"type={mem['memory_type']}")
+            if mem.get("project"):
+                extra.append(f"project={mem['project']}")
+            if mem.get("resolved") is True:
+                extra.append("resolved=true")
+            if mem.get("pinned") is True:
+                extra.append("pinned=true")
+
+            meta = f" ({', '.join(extra)})" if extra else ""
+            memory_lines.append(f"- {date_str}{mem['content']}{meta}")
 
         memory_text = "\n".join(memory_lines)
+
         enhanced_prompt = f"""{SYSTEM_PROMPT}
+
 【从过往对话中检索到的相关记忆】
 {memory_text}
+
 # 记忆应用
 - 像朋友般自然运用这些记忆，不刻意展示
 - 仅在相关话题出现时引用，避免主动提及
 - 对重要信息保持一致性；冲突以新信息为准
 - 模糊记忆可表达不确定性
-记忆是丰富对话的工具，而非对话焦点。"""
+- 如果是未解决问题或持续中的项目，优先维持上下文连续性
+
+记忆是丰富对话的工具，而非对话焦点。
+"""
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return enhanced_prompt
+
     except Exception as e:
         print(f"⚠️ 记忆检索失败: {e}，使用纯人设")
         return SYSTEM_PROMPT
@@ -256,6 +289,7 @@ async def process_memories_background(
     context_messages: list = None
 ):
     global _round_counter
+
     try:
         await save_message(session_id, "user", user_msg, model)
         await save_message(session_id, "assistant", assistant_msg, model)
@@ -285,9 +319,10 @@ async def process_memories_background(
         new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
 
         META_BLACKLIST = [
-            "记忆库", "记忆系统", "检索", "没有被记录", "没有被提取", "记忆遗漏", "尚未被记录",
-            "写入不完整", "检索功能", "系统没有返回", "关键词匹配", "语义匹配", "语义检索",
-            "阈值", "数据库", "seed", "导入", "部署", "bug", "debug", "端口", "网关",
+            "记忆库", "记忆系统", "检索", "没有被记录", "没有被提取", "记忆遗漏",
+            "尚未被记录", "写入不完整", "检索功能", "系统没有返回", "关键词匹配",
+            "语义匹配", "语义检索", "阈值", "数据库", "seed", "导入", "部署",
+            "debug", "端口", "网关",
         ]
 
         filtered = []
@@ -301,15 +336,21 @@ async def process_memories_background(
         for mem in filtered:
             await save_memory(
                 content=mem["content"],
-                importance=mem["importance"],
-                source_session=session_id
+                importance=mem.get("importance", 5),
+                source_session=session_id,
+                memory_type=mem.get("memory_type", "event"),
+                resolved=mem.get("resolved", False),
+                valence=mem.get("valence"),
+                arousal=mem.get("arousal"),
+                project=mem.get("project"),
             )
 
         if filtered:
             total = await get_all_memories_count()
             print(f"💾 已保存 {len(filtered)} 条新记忆，总计 {total} 条")
+
     except Exception as e:
-        print(f"⚠️ 后台记忆处理失败: {e}")
+        print(f"⚠️ 后台记忆处理失败: {type(e).__name__}: {e}")
 
 
 @app.get("/")
@@ -323,7 +364,7 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "AI Memory Gateway v2.1.1-debug-fix",
+        "gateway": "AI Memory Gateway v2.6.0-v2-lite",
         "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
         "system_prompt_length": len(SYSTEM_PROMPT),
         "memory_enabled": MEMORY_ENABLED,
@@ -407,6 +448,7 @@ async def chat_completions(request: Request):
         "Authorization": f"Bearer {upstream_key}",
         "Content-Type": "application/json",
     }
+
     if "openrouter" in upstream_url:
         headers["HTTP-Referer"] = EXTRA_REFERER
         headers["X-Title"] = EXTRA_TITLE
@@ -423,7 +465,11 @@ async def chat_completions(request: Request):
         body["reasoning_effort"] = REASONING_EFFORT
         print(f"🧠 注入推理参数: reasoning_effort={REASONING_EFFORT}")
 
-    print(f"📡 请求: model={model}, upstream_model={upstream_model}, stream={is_stream}, memory={'on' if MEMORY_ENABLED else 'off'}", flush=True)
+    print(
+        f"📡 请求: model={model}, upstream_model={upstream_model}, "
+        f"stream={is_stream}, memory={'on' if MEMORY_ENABLED else 'off'}, url={upstream_url}",
+        flush=True
+    )
 
     body["model"] = upstream_model
 
@@ -447,8 +493,15 @@ async def chat_completions(request: Request):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
     else:
-        async with httpx.AsyncClient(timeout=300) as client:
-            response = await client.post(upstream_url, headers=headers, json=body)
+        try:
+            async with httpx.AsyncClient(timeout=300, verify=certifi.where()) as client:
+                response = await client.post(upstream_url, headers=headers, json=body)
+
+            print(
+                f"📨 非流式上游响应: status={response.status_code}, url={upstream_url}, model={upstream_model}",
+                flush=True
+            )
+
             if response.status_code == 200:
                 resp_data = response.json()
                 assistant_msg = ""
@@ -464,13 +517,27 @@ async def chat_completions(request: Request):
                             context_messages=original_messages
                         )
                     )
+
                 return JSONResponse(status_code=200, content=resp_data)
-            else:
-                try:
-                    err = response.json()
-                except Exception:
-                    err = {"error": response.text}
-                return JSONResponse(status_code=response.status_code, content=err)
+
+            print(
+                f"⚠️ 非流式上游失败: status={response.status_code}, body={response.text[:1000]}",
+                flush=True
+            )
+
+            try:
+                err = response.json()
+            except Exception:
+                err = {"error": response.text}
+
+            return JSONResponse(status_code=response.status_code, content=err)
+
+        except Exception as e:
+            print(f"⚠️ 非流式上游请求异常: {type(e).__name__}: {e}, url={upstream_url}", flush=True)
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"上游连接失败: {type(e).__name__}: {e}"}
+            )
 
 
 async def stream_and_capture(
@@ -485,28 +552,50 @@ async def stream_and_capture(
     full_response = []
     line_buffer = ""
 
-    async with httpx.AsyncClient(timeout=300) as client:
-        async with client.stream("POST", upstream_url, headers=headers, json=body) as response:
-            upstream_ct = response.headers.get("content-type", "")
-            print(f"📨 上游响应: status={response.status_code}, content-type={upstream_ct}", flush=True)
+    try:
+        async with httpx.AsyncClient(timeout=300, verify=certifi.where()) as client:
+            async with client.stream("POST", upstream_url, headers=headers, json=body) as response:
+                upstream_ct = response.headers.get("content-type", "")
+                print(
+                    f"📨 上游响应: status={response.status_code}, content-type={upstream_ct}, url={upstream_url}",
+                    flush=True
+                )
 
-            async for chunk in response.aiter_bytes():
-                yield chunk
-                text = chunk.decode("utf-8", errors="ignore")
-                line_buffer += text
+                if response.status_code >= 400:
+                    error_text = await response.aread()
+                    preview = error_text[:1000].decode("utf-8", errors="ignore")
+                    print(
+                        f"⚠️ 上游流式请求失败: status={response.status_code}, body={preview}",
+                        flush=True
+                    )
+                    yield f"data: {json.dumps({'error': {'message': f'upstream error {response.status_code}', 'type': 'upstream_error'}}, ensure_ascii=False)}\n\n".encode("utf-8")
+                    yield b"data: [DONE]\n\n"
+                    return
 
-                while "\n" in line_buffer:
-                    line, line_buffer = line_buffer.split("\n", 1)
-                    line = line.strip()
-                    if line.startswith("data: ") and line != "data: [DONE]":
-                        try:
-                            data = json.loads(line[6:])
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                full_response.append(content)
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            pass
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+
+                    text = chunk.decode("utf-8", errors="ignore")
+                    line_buffer += text
+
+                    while "\n" in line_buffer:
+                        line, line_buffer = line_buffer.split("\n", 1)
+                        line = line.strip()
+                        if line.startswith("data: ") and line != "data: [DONE]":
+                            try:
+                                data = json.loads(line[6:])
+                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    full_response.append(content)
+                            except (json.JSONDecodeError, KeyError, IndexError):
+                                pass
+
+    except Exception as e:
+        print(f"⚠️ 流式上游请求异常: {type(e).__name__}: {e}, url={upstream_url}", flush=True)
+        yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'upstream_connection_error'}}, ensure_ascii=False)}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+        return
 
     assistant_msg = "".join(full_response)
     if MEMORY_ENABLED and user_message and assistant_msg:
@@ -554,6 +643,7 @@ async def import_seed_memories():
 async def export_memories():
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用（设置 MEMORY_ENABLED=true 开启）"}
+
     try:
         memories = await get_all_memories()
         for mem in memories:
@@ -561,7 +651,7 @@ async def export_memories():
                 mem["created_at"] = str(mem["created_at"])
         return {
             "total": len(memories),
-            "exported_at": str(__import__("datetime").datetime.now()),
+            "exported_at": str(datetime.now()),
             "memories": memories,
         }
     except Exception as e:
@@ -571,7 +661,7 @@ async def export_memories():
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
     if not MEMORY_ENABLED:
-        return HTMLResponse("<h3>记忆系统未启用（设置 MEMORY_ENABLED=true 开启）</h3>")
+        return HTMLResponse("记忆系统未启用（设置 MEMORY_ENABLED=true 开启）")
     return templates.TemplateResponse("dashboard.html", {"request": request})
 
 
@@ -579,14 +669,17 @@ async def dashboard_page(request: Request):
 async def api_get_memories():
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
+
     memories = await get_all_memories_detail()
     tz_offset = timezone(timedelta(hours=TIMEZONE_HOURS))
+
     for m in memories:
         if m.get("created_at"):
             dt = m["created_at"]
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             m["created_at"] = dt.astimezone(tz_offset).strftime("%Y-%m-%d %H:%M:%S")
+
     return {"memories": memories}
 
 
@@ -594,8 +687,19 @@ async def api_get_memories():
 async def api_update_memory(memory_id: int, request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
+
     data = await request.json()
-    await update_memory(memory_id, content=data.get("content"), importance=data.get("importance"))
+    await update_memory(
+        memory_id,
+        content=data.get("content"),
+        importance=data.get("importance"),
+        memory_type=data.get("memory_type"),
+        resolved=data.get("resolved"),
+        pinned=data.get("pinned"),
+        valence=data.get("valence"),
+        arousal=data.get("arousal"),
+        project=data.get("project"),
+    )
     return {"status": "ok", "id": memory_id}
 
 
@@ -611,12 +715,25 @@ async def api_delete_memory(memory_id: int):
 async def api_batch_update(request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
+
     data = await request.json()
     updates = data.get("updates", [])
     if not updates:
         return {"error": "没有要更新的记忆"}
+
     for item in updates:
-        await update_memory(item["id"], content=item.get("content"), importance=item.get("importance"))
+        await update_memory(
+            item["id"],
+            content=item.get("content"),
+            importance=item.get("importance"),
+            memory_type=item.get("memory_type"),
+            resolved=item.get("resolved"),
+            pinned=item.get("pinned"),
+            valence=item.get("valence"),
+            arousal=item.get("arousal"),
+            project=item.get("project"),
+        )
+
     return {"status": "ok", "updated": len(updates)}
 
 
@@ -624,10 +741,12 @@ async def api_batch_update(request: Request):
 async def api_batch_delete(request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
+
     data = await request.json()
     ids = data.get("ids", [])
     if not ids:
         return {"error": "未选择记忆"}
+
     await delete_memories_batch(ids)
     return {"status": "ok", "deleted": len(ids)}
 
@@ -636,10 +755,12 @@ async def api_batch_delete(request: Request):
 async def import_text_memories(request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用（设置 MEMORY_ENABLED=true 开启）"}
+
     try:
         data = await request.json()
         lines = data.get("lines", [])
         skip_scoring = data.get("skip_scoring", False)
+
         if not lines:
             return {"error": "没有找到记忆条目"}
 
@@ -650,10 +771,12 @@ async def import_text_memories(request: Request):
 
         imported = 0
         skipped = 0
+
         for mem in scored:
             content = mem.get("content", "")
             if not content:
                 continue
+
             pool = await get_pool()
             async with pool.acquire() as conn:
                 existing = await conn.fetchval(
@@ -663,15 +786,22 @@ async def import_text_memories(request: Request):
                 if existing > 0:
                     skipped += 1
                     continue
+
             await save_memory(
                 content=content,
                 importance=mem.get("importance", 5),
-                source_session="text-import"
+                source_session="text-import",
             )
             imported += 1
 
         total = await get_all_memories_count()
-        return {"status": "done", "imported": imported, "skipped": skipped, "total": total}
+        return {
+            "status": "done",
+            "imported": imported,
+            "skipped": skipped,
+            "total": total
+        }
+
     except Exception as e:
         return {"error": str(e)}
 
@@ -680,18 +810,22 @@ async def import_text_memories(request: Request):
 async def import_memories(request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用（设置 MEMORY_ENABLED=true 开启）"}
+
     try:
         data = await request.json()
         memories = data.get("memories", [])
+
         if not memories:
             return {"error": "没有找到记忆数据，请确认 JSON 格式正确"}
 
         imported = 0
         skipped = 0
+
         for mem in memories:
             content = mem.get("content", "")
             if not content:
                 continue
+
             pool = await get_pool()
             async with pool.acquire() as conn:
                 existing = await conn.fetchval(
@@ -701,31 +835,48 @@ async def import_memories(request: Request):
                 if existing > 0:
                     skipped += 1
                     continue
+
             await save_memory(
                 content=content,
                 importance=mem.get("importance", 5),
                 source_session=mem.get("source_session", "json-import"),
+                memory_type=mem.get("memory_type", "event"),
+                resolved=mem.get("resolved", False),
+                valence=mem.get("valence"),
+                arousal=mem.get("arousal"),
+                project=mem.get("project"),
             )
             imported += 1
 
         total = await get_all_memories_count()
-        return {"status": "done", "imported": imported, "skipped": skipped, "total": total}
+        return {
+            "status": "done",
+            "imported": imported,
+            "skipped": skipped,
+            "total": total
+        }
+
     except Exception as e:
         return {"error": str(e)}
 
 
 if __name__ == "__main__":
     import uvicorn
+
     print(f"🚀 AI Memory Gateway 启动中... 端口 {PORT}")
     print(f"📝 人设长度：{len(SYSTEM_PROMPT)} 字符")
     print(f"🤖 默认模型：{DEFAULT_MODEL}")
     print(f"🔗 API 地址：{API_BASE_URL}")
     print(f"🧠 记忆系统：{'开启' if MEMORY_ENABLED else '关闭'}")
-    print(f"🔄 记忆提取间隔：{'禁用' if MEMORY_EXTRACT_INTERVAL == 0 else '每轮提取' if MEMORY_EXTRACT_INTERVAL == 1 else f'每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次'}")
+    print(
+        f"🔄 记忆提取间隔："
+        f"{'禁用' if MEMORY_EXTRACT_INTERVAL == 0 else '每轮提取' if MEMORY_EXTRACT_INTERVAL == 1 else f'每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次'}"
+    )
     if FORCE_STREAM:
         print("⚡ 强制流式传输：开启")
     if REASONING_EFFORT:
         print(f"🧠 推理参数注入：{REASONING_EFFORT}")
     if DEBUG_MODE:
         print(f"🛠️ DEBUG_MODE：开启，历史条数上限={DEBUG_MAX_HISTORY}")
+
     uvicorn.run(app, host="0.0.0.0", port=PORT)
