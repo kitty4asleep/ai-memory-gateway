@@ -6,6 +6,7 @@
 - 创建表结构
 - 存储对话记录
 - 存储/检索记忆（带中文分词和加权排序）
+- 旧记忆结构化回填
 """
 
 import os
@@ -54,6 +55,19 @@ async def close_pool():
 # ============================================================
 # 表结构初始化
 # ============================================================
+
+async def ensure_backfilled_at_column():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            ALTER TABLE memories
+            ADD COLUMN IF NOT EXISTS backfilled_at TIMESTAMPTZ;
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_backfilled_at
+            ON memories(backfilled_at);
+        """)
+
 
 async def init_tables():
     pool = await get_pool()
@@ -126,7 +140,8 @@ async def init_tables():
             ON conversations (session_id, created_at);
         """)
 
-        print("✅ 数据库表结构已就绪")
+    await ensure_backfilled_at_column()
+    print("✅ 数据库表结构已就绪")
 
 
 # ============================================================
@@ -365,7 +380,7 @@ async def get_recent_memories(limit: int = 20):
             """
             SELECT
                 id, content, importance, memory_type, resolved, activation_count,
-                pinned, valence, arousal, project, created_at
+                pinned, valence, arousal, project, created_at, backfilled_at
             FROM memories
             ORDER BY created_at DESC
             LIMIT $1
@@ -389,7 +404,7 @@ async def get_all_memories():
             SELECT
                 content, importance, source_session,
                 memory_type, resolved, activation_count,
-                pinned, valence, arousal, project, created_at
+                pinned, valence, arousal, project, created_at, backfilled_at
             FROM memories
             ORDER BY id
         """)
@@ -404,7 +419,7 @@ async def get_all_memories_detail():
             SELECT
                 id, content, importance, source_session,
                 memory_type, resolved, activation_count,
-                pinned, valence, arousal, project, created_at
+                pinned, valence, arousal, project, created_at, backfilled_at
             FROM memories
             ORDER BY id
         """)
@@ -494,10 +509,15 @@ async def delete_memories_batch(memory_ids: list):
             memory_ids
         )
 
+
+# ============================================================
+# 旧记忆回填
+# ============================================================
+
 async def get_memories_for_backfill(limit: int = 50, only_unclassified: bool = True):
     """
     获取需要回填结构化字段的记忆。
-    only_unclassified=True 时，只取看起来还没被结构化过的旧记忆。
+    现在优先依赖 backfilled_at，避免重复抓取已经处理过的旧记忆。
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -507,14 +527,9 @@ async def get_memories_for_backfill(limit: int = 50, only_unclassified: bool = T
                 SELECT
                     id, content, importance, source_session,
                     memory_type, resolved, activation_count,
-                    pinned, valence, arousal, project, created_at
+                    pinned, valence, arousal, project, created_at, backfilled_at
                 FROM memories
-                WHERE
-                    memory_type IS NULL
-                    OR valence IS NULL
-                    OR arousal IS NULL
-                    OR project IS NULL
-                    OR (memory_type = 'event' AND importance = 5 AND valence = 0 AND arousal = 0.2)
+                WHERE backfilled_at IS NULL
                 ORDER BY id
                 LIMIT $1
                 """,
@@ -526,7 +541,7 @@ async def get_memories_for_backfill(limit: int = 50, only_unclassified: bool = T
                 SELECT
                     id, content, importance, source_session,
                     memory_type, resolved, activation_count,
-                    pinned, valence, arousal, project, created_at
+                    pinned, valence, arousal, project, created_at, backfilled_at
                 FROM memories
                 ORDER BY id
                 LIMIT $1
@@ -544,30 +559,54 @@ async def update_memory_structured(
     valence: float = None,
     arousal: float = None,
     project: str = None,
+    mark_backfilled: bool = True,
 ):
     """
     专门用于回填结构化字段。
+    更新结构化字段，并可选写入 backfilled_at。
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE memories
-            SET
-                importance = $1,
-                memory_type = $2,
-                resolved = $3,
-                valence = $4,
-                arousal = $5,
-                project = $6
-            WHERE id = $7
-            """,
-            importance,
-            memory_type,
-            resolved,
-            valence,
-            arousal,
-            project,
-            memory_id,
-        )
-
+        if mark_backfilled:
+            await conn.execute(
+                """
+                UPDATE memories
+                SET
+                    importance = $1,
+                    memory_type = $2,
+                    resolved = $3,
+                    valence = $4,
+                    arousal = $5,
+                    project = $6,
+                    backfilled_at = NOW()
+                WHERE id = $7
+                """,
+                importance,
+                memory_type,
+                resolved,
+                valence,
+                arousal,
+                project,
+                memory_id,
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE memories
+                SET
+                    importance = $1,
+                    memory_type = $2,
+                    resolved = $3,
+                    valence = $4,
+                    arousal = $5,
+                    project = $6
+                WHERE id = $7
+                """,
+                importance,
+                memory_type,
+                resolved,
+                valence,
+                arousal,
+                project,
+                memory_id,
+            )
