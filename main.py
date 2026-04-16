@@ -212,7 +212,7 @@ async def lifespan(app: FastAPI):
         await close_pool()
 
 
-app = FastAPI(title="AI Memory Gateway", version="2.7.0-import-reclassify", lifespan=lifespan)
+app = FastAPI(title="AI Memory Gateway", version="2.9.0-anchor-backfill", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -358,7 +358,7 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "AI Memory Gateway v2.7.0-import-reclassify",
+        "gateway": "AI Memory Gateway v2.9.0-anchor-backfill",
         "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
         "system_prompt_length": len(SYSTEM_PROMPT),
         "memory_enabled": MEMORY_ENABLED,
@@ -555,8 +555,8 @@ async def stream_and_capture(
                     text = chunk.decode("utf-8", errors="ignore")
                     line_buffer += text
 
-                    while "\\n" in line_buffer:
-                        line, line_buffer = line_buffer.split("\\n", 1)
+                    while "\n" in line_buffer:
+                        line, line_buffer = line_buffer.split("\n", 1)
                         line = line.strip()
                         if line.startswith("data: ") and line != "data: [DONE]":
                             try:
@@ -733,7 +733,7 @@ async def import_text_memories(request: Request):
         data = await request.json()
         lines = data.get("lines", [])
         skip_scoring = data.get("skip_scoring", False)
-        full_classify = data.get("full_classify", True)  # 默认开启完整结构化
+        full_classify = data.get("full_classify", True)
 
         if not lines:
             return {"error": "没有找到记忆条目"}
@@ -816,7 +816,7 @@ async def import_memories(request: Request):
     try:
         data = await request.json()
         memories = data.get("memories", [])
-        reclassify = data.get("reclassify", True)  # 默认开启重分类
+        reclassify = data.get("reclassify", True)
 
         if not memories:
             return {"error": "没有找到记忆数据，请确认 JSON 格式正确"}
@@ -887,6 +887,126 @@ async def import_memories(request: Request):
 
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/admin/backfill-memories")
+async def admin_backfill_memories(
+    request: Request,
+    limit: int = 20,
+    batch_size: int = 10,
+    dry_run: bool = True,
+    all_memories: bool = False,
+):
+    """
+    旧记忆结构化回填接口
+
+    用法示例：
+    /admin/backfill-memories?limit=20&batch_size=10&dry_run=true&token=xxxx
+    /admin/backfill-memories?limit=50&batch_size=10&dry_run=false&token=xxxx
+    /admin/backfill-memories?limit=100&batch_size=10&dry_run=false&all_memories=true&token=xxxx
+    """
+
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+
+    token = request.headers.get("X-Debug-Token", "") or request.query_params.get("token", "")
+    if not DEBUG_TOKEN or token != DEBUG_TOKEN:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+
+    try:
+        from database import get_memories_for_backfill, update_memory_structured
+        from memory_extractor import classify_memory_texts
+
+        only_unclassified = not all_memories
+
+        memories = await get_memories_for_backfill(limit=limit, only_unclassified=only_unclassified)
+
+        if not memories:
+            return {
+                "status": "ok",
+                "message": "没有需要回填的旧记忆",
+                "updated": 0,
+                "dry_run": dry_run,
+            }
+
+        total_updated = 0
+        preview = []
+
+        for start in range(0, len(memories), batch_size):
+            batch = memories[start:start + batch_size]
+            texts = [m["content"] for m in batch]
+
+            classified = await classify_memory_texts(texts)
+
+            result_map = {}
+            for item in classified:
+                content = str(item.get("content", "")).strip()
+                if content:
+                    result_map[content] = item
+
+            for mem in batch:
+                original_content = str(mem["content"]).strip()
+                item = result_map.get(original_content)
+
+                if not item:
+                    preview.append({
+                        "id": mem["id"],
+                        "content": original_content[:100],
+                        "status": "skipped_no_match",
+                    })
+                    continue
+
+                row = {
+                    "id": mem["id"],
+                    "content": original_content,
+                    "importance": item.get("importance", 5),
+                    "memory_type": item.get("memory_type", "event"),
+                    "resolved": item.get("resolved", False),
+                    "valence": item.get("valence"),
+                    "arousal": item.get("arousal"),
+                    "project": item.get("project"),
+                }
+
+                preview.append({
+                    "id": row["id"],
+                    "content": row["content"][:120],
+                    "importance": row["importance"],
+                    "memory_type": row["memory_type"],
+                    "resolved": row["resolved"],
+                    "valence": row["valence"],
+                    "arousal": row["arousal"],
+                    "project": row["project"],
+                    "status": "dry_run" if dry_run else "updated",
+                })
+
+                if not dry_run:
+                    await update_memory_structured(
+                        memory_id=row["id"],
+                        importance=row["importance"],
+                        memory_type=row["memory_type"],
+                        resolved=row["resolved"],
+                        valence=row["valence"],
+                        arousal=row["arousal"],
+                        project=row["project"],
+                    )
+                    total_updated += 1
+
+        return {
+            "status": "ok",
+            "dry_run": dry_run,
+            "only_unclassified": only_unclassified,
+            "requested_limit": limit,
+            "batch_size": batch_size,
+            "fetched": len(memories),
+            "updated": total_updated,
+            "preview": preview[:100],
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"{type(e).__name__}: {e}"}
+        )
 
 
 if __name__ == "__main__":
