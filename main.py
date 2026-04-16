@@ -32,7 +32,7 @@ from database import (
     delete_memory,
     delete_memories_batch,
 )
-from memory_extractor import extract_memories, score_memories
+from memory_extractor import extract_memories, score_memories, classify_memory_texts
 from routing_config import PROVIDERS, MODEL_ROUTING, MODEL_ALIASES
 
 
@@ -70,9 +70,6 @@ MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "8000"))
 
 
 def trim_messages_by_chars(messages, limit=MAX_PROMPT_CHARS):
-    """
-    保留全部 system 消息；非 system 消息从后往前保留直到不超过 limit
-    """
     system_msgs = [m for m in messages if m.get("role") == "system"]
     other_msgs = [m for m in messages if m.get("role") != "system"]
 
@@ -160,10 +157,7 @@ def _sanitize_messages_for_debug(messages: list):
         content = m.get("content", "")
         if isinstance(content, str) and len(content) > DEBUG_MAX_CONTENT_LEN:
             content = content[:DEBUG_MAX_CONTENT_LEN] + "...[TRUNCATED]"
-        sanitized.append({
-            "role": role,
-            "content": content
-        })
+        sanitized.append({"role": role, "content": content})
     return sanitized
 
 
@@ -218,7 +212,7 @@ async def lifespan(app: FastAPI):
         await close_pool()
 
 
-app = FastAPI(title="AI Memory Gateway", version="2.6.0-v2-lite", lifespan=lifespan)
+app = FastAPI(title="AI Memory Gateway", version="2.7.0-import-reclassify", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -364,7 +358,7 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "AI Memory Gateway v2.6.0-v2-lite",
+        "gateway": "AI Memory Gateway v2.7.0-import-reclassify",
         "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
         "system_prompt_length": len(SYSTEM_PROMPT),
         "memory_enabled": MEMORY_ENABLED,
@@ -433,16 +427,10 @@ async def chat_completions(request: Request):
     upstream_model = provider["model"]
 
     if not upstream_url:
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"上游 BASE_URL 未设置：model={model}"}
-        )
+        return JSONResponse(status_code=500, content={"error": f"上游 BASE_URL 未设置：model={model}"})
 
     if not upstream_key:
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"上游 API Key 未设置：model={model}, upstream={upstream_url}"}
-        )
+        return JSONResponse(status_code=500, content={"error": f"上游 API Key 未设置：model={model}, upstream={upstream_url}"})
 
     headers = {
         "Authorization": f"Bearer {upstream_key}",
@@ -486,9 +474,7 @@ async def chat_completions(request: Request):
 
     if is_stream:
         return StreamingResponse(
-            stream_and_capture(
-                headers, body, session_id, user_message, model, original_messages, upstream_url
-            ),
+            stream_and_capture(headers, body, session_id, user_message, model, original_messages, upstream_url),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
@@ -520,10 +506,7 @@ async def chat_completions(request: Request):
 
                 return JSONResponse(status_code=200, content=resp_data)
 
-            print(
-                f"⚠️ 非流式上游失败: status={response.status_code}, body={response.text[:1000]}",
-                flush=True
-            )
+            print(f"⚠️ 非流式上游失败: status={response.status_code}, body={response.text[:1000]}", flush=True)
 
             try:
                 err = response.json()
@@ -534,10 +517,7 @@ async def chat_completions(request: Request):
 
         except Exception as e:
             print(f"⚠️ 非流式上游请求异常: {type(e).__name__}: {e}, url={upstream_url}", flush=True)
-            return JSONResponse(
-                status_code=502,
-                content={"error": f"上游连接失败: {type(e).__name__}: {e}"}
-            )
+            return JSONResponse(status_code=502, content={"error": f"上游连接失败: {type(e).__name__}: {e}"})
 
 
 async def stream_and_capture(
@@ -564,10 +544,7 @@ async def stream_and_capture(
                 if response.status_code >= 400:
                     error_text = await response.aread()
                     preview = error_text[:1000].decode("utf-8", errors="ignore")
-                    print(
-                        f"⚠️ 上游流式请求失败: status={response.status_code}, body={preview}",
-                        flush=True
-                    )
+                    print(f"⚠️ 上游流式请求失败: status={response.status_code}, body={preview}", flush=True)
                     yield f"data: {json.dumps({'error': {'message': f'upstream error {response.status_code}', 'type': 'upstream_error'}}, ensure_ascii=False)}\n\n".encode("utf-8")
                     yield b"data: [DONE]\n\n"
                     return
@@ -578,8 +555,8 @@ async def stream_and_capture(
                     text = chunk.decode("utf-8", errors="ignore")
                     line_buffer += text
 
-                    while "\n" in line_buffer:
-                        line, line_buffer = line_buffer.split("\n", 1)
+                    while "\\n" in line_buffer:
+                        line, line_buffer = line_buffer.split("\\n", 1)
                         line = line.strip()
                         if line.startswith("data: ") and line != "data: [DONE]":
                             try:
@@ -620,11 +597,7 @@ async def debug_recent_requests(request: Request):
     auth_err = _check_debug_auth(request)
     if auth_err:
         return auth_err
-    return {
-        "status": "ok",
-        "count": len(DEBUG_HISTORY),
-        "items": list(DEBUG_HISTORY),
-    }
+    return {"status": "ok", "count": len(DEBUG_HISTORY), "items": list(DEBUG_HISTORY)}
 
 
 @app.get("/import/seed-memories")
@@ -760,29 +733,52 @@ async def import_text_memories(request: Request):
         data = await request.json()
         lines = data.get("lines", [])
         skip_scoring = data.get("skip_scoring", False)
+        full_classify = data.get("full_classify", True)  # 默认开启完整结构化
 
         if not lines:
             return {"error": "没有找到记忆条目"}
 
-        if skip_scoring:
-            scored = [{"content": t, "importance": 5} for t in lines]
+        if full_classify:
+            classified = await classify_memory_texts(lines)
+        elif skip_scoring:
+            classified = [
+                {
+                    "content": t,
+                    "importance": 5,
+                    "memory_type": "event",
+                    "resolved": False,
+                    "valence": 0.0,
+                    "arousal": 0.2,
+                    "project": None,
+                }
+                for t in lines
+            ]
         else:
             scored = await score_memories(lines)
+            classified = [
+                {
+                    "content": mem["content"],
+                    "importance": mem.get("importance", 5),
+                    "memory_type": "event",
+                    "resolved": False,
+                    "valence": 0.0,
+                    "arousal": 0.2,
+                    "project": None,
+                }
+                for mem in scored
+            ]
 
         imported = 0
         skipped = 0
 
-        for mem in scored:
+        for mem in classified:
             content = mem.get("content", "")
             if not content:
                 continue
 
             pool = await get_pool()
             async with pool.acquire() as conn:
-                existing = await conn.fetchval(
-                    "SELECT COUNT(*) FROM memories WHERE content = $1",
-                    content
-                )
+                existing = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE content = $1", content)
                 if existing > 0:
                     skipped += 1
                     continue
@@ -791,15 +787,21 @@ async def import_text_memories(request: Request):
                 content=content,
                 importance=mem.get("importance", 5),
                 source_session="text-import",
+                memory_type=mem.get("memory_type", "event"),
+                resolved=mem.get("resolved", False),
+                valence=mem.get("valence"),
+                arousal=mem.get("arousal"),
+                project=mem.get("project"),
             )
             imported += 1
 
         total = await get_all_memories_count()
         return {
             "status": "done",
+            "mode": "full_classify" if full_classify else ("skip_scoring" if skip_scoring else "score_only"),
             "imported": imported,
             "skipped": skipped,
-            "total": total
+            "total": total,
         }
 
     except Exception as e:
@@ -814,24 +816,50 @@ async def import_memories(request: Request):
     try:
         data = await request.json()
         memories = data.get("memories", [])
+        reclassify = data.get("reclassify", True)  # 默认开启重分类
 
         if not memories:
             return {"error": "没有找到记忆数据，请确认 JSON 格式正确"}
 
+        raw_texts = []
+        raw_items = []
+
+        for mem in memories:
+            content = str(mem.get("content", "")).strip()
+            if not content:
+                continue
+            raw_texts.append(content)
+            raw_items.append(mem)
+
+        if not raw_texts:
+            return {"error": "导入数据里没有有效 content"}
+
+        if reclassify:
+            final_memories = await classify_memory_texts(raw_texts)
+        else:
+            final_memories = []
+            for mem in raw_items:
+                final_memories.append({
+                    "content": str(mem.get("content", "")).strip(),
+                    "importance": int(mem.get("importance", 5)),
+                    "memory_type": mem.get("memory_type", "event"),
+                    "resolved": bool(mem.get("resolved", False)),
+                    "valence": mem.get("valence"),
+                    "arousal": mem.get("arousal"),
+                    "project": mem.get("project"),
+                })
+
         imported = 0
         skipped = 0
 
-        for mem in memories:
+        for mem in final_memories:
             content = mem.get("content", "")
             if not content:
                 continue
 
             pool = await get_pool()
             async with pool.acquire() as conn:
-                existing = await conn.fetchval(
-                    "SELECT COUNT(*) FROM memories WHERE content = $1",
-                    content
-                )
+                existing = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE content = $1", content)
                 if existing > 0:
                     skipped += 1
                     continue
@@ -839,7 +867,7 @@ async def import_memories(request: Request):
             await save_memory(
                 content=content,
                 importance=mem.get("importance", 5),
-                source_session=mem.get("source_session", "json-import"),
+                source_session="json-import",
                 memory_type=mem.get("memory_type", "event"),
                 resolved=mem.get("resolved", False),
                 valence=mem.get("valence"),
@@ -851,9 +879,10 @@ async def import_memories(request: Request):
         total = await get_all_memories_count()
         return {
             "status": "done",
+            "mode": "reclassify" if reclassify else "raw_restore",
             "imported": imported,
             "skipped": skipped,
-            "total": total
+            "total": total,
         }
 
     except Exception as e:
