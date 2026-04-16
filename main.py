@@ -146,7 +146,6 @@ LATEST_DEBUG_SNAPSHOT = {
 }
 DEBUG_HISTORY = deque(maxlen=DEBUG_MAX_HISTORY)
 
-
 BACKFILL_STATE = {
     "running": False,
     "stop_requested": False,
@@ -256,7 +255,7 @@ async def lifespan(app: FastAPI):
         await close_pool()
 
 
-app = FastAPI(title="AI Memory Gateway", version="3.0.0-async-backfill", lifespan=lifespan)
+app = FastAPI(title="AI Memory Gateway", version="3.1.0-backfilled-at", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -427,34 +426,29 @@ async def run_backfill_job(limit: int, batch_size: int, only_unclassified: bool,
             BACKFILL_STATE["current_batch"] = start // batch_size + 1
 
             print(
-                f"🔄 backfill 批次 {BACKFILL_STATE['current_batch']}/{total_batches} "
-                f"size={len(batch)}",
+                f"🔄 backfill 批次 {BACKFILL_STATE['current_batch']}/{total_batches} size={len(batch)}",
                 flush=True
             )
 
             try:
                 classified = await classify_memory_texts(texts)
 
-                result_map = {}
-                for item in classified:
-                    content = str(item.get("content", "")).strip()
-                    if content:
-                        result_map[content] = item
-
-                for mem in batch:
+                # 优先按顺序匹配，减少轻微改写导致的 skipped_no_match
+                for idx, mem in enumerate(batch):
                     if BACKFILL_STATE["stop_requested"]:
                         break
 
+                    item = classified[idx] if idx < len(classified) else None
                     original_content = str(mem["content"]).strip()
-                    item = result_map.get(original_content)
 
                     if not item:
                         BACKFILL_STATE["failed"] += 1
-                        BACKFILL_STATE["preview"].append({
-                            "id": mem["id"],
-                            "content": original_content[:120],
-                            "status": "skipped_no_match",
-                        })
+                        if len(BACKFILL_STATE["preview"]) < 200:
+                            BACKFILL_STATE["preview"].append({
+                                "id": mem["id"],
+                                "content": original_content[:120],
+                                "status": "skipped_no_match",
+                            })
                         continue
 
                     row = {
@@ -490,6 +484,7 @@ async def run_backfill_job(limit: int, batch_size: int, only_unclassified: bool,
                             valence=row["valence"],
                             arousal=row["arousal"],
                             project=row["project"],
+                            mark_backfilled=True,
                         )
                         BACKFILL_STATE["updated"] += 1
 
@@ -523,7 +518,7 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "AI Memory Gateway v3.0.0-async-backfill",
+        "gateway": "AI Memory Gateway v3.1.0-backfilled-at",
         "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
         "system_prompt_length": len(SYSTEM_PROMPT),
         "memory_enabled": MEMORY_ENABLED,
