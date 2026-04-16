@@ -7,11 +7,13 @@
 2. 对纯文本记忆进行自动评分
 3. 对导入/旧记忆做完整结构化分类（importance + memory_type + resolved + valence + arousal + project）
 
-v2.7 导入重判版：
+v2.8 分类强化版：
 - 支持导入时完整 AI 结构化
 - 支持旧记忆批量重分类
 - 显式使用 certifi
 - 增强非200错误日志
+- 增强文本清洗
+- 强化 preference / relationship / rule / project / issue / todo 的分类边界
 """
 
 import os
@@ -79,10 +81,12 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 
 # importance 评分规则（1-10）
 - 9-10：核心且长期稳定的信息
+  例如：身份信息、重要关系、长期规则、明确禁忌、长期稳定偏好、长期项目主线
 - 7-8：重要且未来高概率复用的信息
+  例如：重要偏好、重大事件、持续性情感需求、重要项目进展、长期未解决问题
 - 5-6：中等重要、未来可能会用到的信息
 - 3-4：短期状态、一次性提及、低复用信息
-- 1-2：琐碎、低价值、几乎不影响未来对话的信息
+- 1-2：琐碎、低价值信息
 
 # memory_type 取值规则
 只能使用以下枚举值之一：
@@ -96,6 +100,22 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 - todo
 - emotion_event
 
+# memory_type 判定优先规则【很重要】
+- 如果内容是在描述用户“喜欢什么 / 不喜欢什么 / 偏好什么 / 讨厌什么 / 倾向于什么 / 希望如何沟通”，优先判为 `preference`
+- 如果内容是在描述双方“关系定位 / 称呼 / 互动模式 / 边界 / 主导-顺从动态”，优先判为 `relationship`
+- 如果内容是在描述“长期规则 / 明确要求 / 禁忌 / 使用习惯 / 固定写作要求”，优先判为 `rule`
+- 如果内容是在描述“长期项目 / 持续推进的任务 / 技术路线 / 阶段进展”，优先判为 `project`
+- 如果内容是在描述“未解决的问题 / 卡住的点 / 仍待处理的故障”，优先判为 `issue`
+- 如果内容是在描述“下一步要做什么 / 待办 / 约定后续动作”，优先判为 `todo`
+- 如果内容是在描述“强情绪、强烈体验、关系中的情绪峰值事件”，优先判为 `emotion_event`
+- 只有在内容主要是在描述“一次具体发生过的事情”，且不明显属于以上类型时，才判为 `event`
+
+# 特别禁止
+- 不要把稳定偏好判成 `event`
+- 不要把长期规则判成 `event`
+- 不要把关系设定判成 `event`
+- 不要把长期项目主线判成 `event`
+
 # resolved 规则
 - 对 issue / todo / project，如果明显已经解决，可以设为 true
 - 如果仍未解决或未来还要继续跟进，设为 false
@@ -104,6 +124,8 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 # valence / arousal 规则
 - valence：情绪效价，范围 -1 到 1
 - arousal：情绪强度，范围 0 到 1
+- 对纯规则、纯偏好、纯身份信息，如果没有明显情绪色彩，可用较保守值
+  例如 valence=0, arousal=0.2
 
 # project 字段
 - 如果该记忆明显属于某个长期项目，填项目名
@@ -135,8 +157,8 @@ EXTRACTION_PROMPT = """你是信息提取专家，负责从对话中识别并提
 SCORING_PROMPT = """你是记忆重要性评分专家。请对以下记忆条目逐条评分。
 
 # 评分规则（1-10）
-- 9-10：核心身份信息（名字、生日、职业、重要关系、长期规则、明确禁忌）
-- 7-8：重要偏好、重大事件、深层情感、重要项目进展、稳定使用习惯、长期未解决问题
+- 9-10：核心身份信息、重要关系、长期规则、明确禁忌、长期稳定偏好
+- 7-8：重要偏好、重大事件、深层情感、重要项目进展、长期未解决问题
 - 5-6：日常习惯、一般偏好、阶段性安排、近期状态
 - 3-4：临时状态、偶然提及、低复用信息
 - 1-2：琐碎信息、几乎不会影响未来对话的信息
@@ -176,6 +198,30 @@ CLASSIFY_IMPORT_PROMPT = """你是长期记忆结构化整理专家。
 - emotion_event
 
 # 判断原则
+
+## memory_type 判定优先规则【最重要】
+- 如果内容是在描述用户“喜欢什么 / 不喜欢什么 / 偏好什么 / 厌恶什么 / 倾向于什么 / 希望如何沟通”，优先判为 `preference`
+- 如果内容是在描述双方“关系定位 / 称呼 / 互动模式 / 边界 / 主导-顺从动态”，优先判为 `relationship`
+- 如果内容是在描述“长期规则 / 明确要求 / 禁忌 / 使用习惯 / 固定写作要求”，优先判为 `rule`
+- 如果内容是在描述“长期项目 / 持续推进的任务 / 技术路线 / 阶段进展”，优先判为 `project`
+- 如果内容是在描述“未解决的问题 / 卡住的点 / 仍待处理的故障”，优先判为 `issue`
+- 如果内容是在描述“下一步要做什么 / 待办 / 约定后续动作”，优先判为 `todo`
+- 如果内容是在描述“强情绪、强烈体验、关系中的情绪峰值事件”，优先判为 `emotion_event`
+- 只有在内容主要是在描述“一次具体发生过的事情”，且不明显属于以上类型时，才判为 `event`
+
+## 特别禁止
+- 不要把稳定偏好判成 `event`
+- 不要把长期规则判成 `event`
+- 不要把关系设定判成 `event`
+- 不要把长期项目主线判成 `event`
+
+## 补充例子
+- “用户喜欢沉稳、有主见、能主导的沟通方式，不喜欢 emoji。” → `preference`
+- “用户希望始终保留前端 system，不要被网关覆盖。” → `rule`
+- “用户和AI之间存在稳定的亲密关系设定。” → `relationship`
+- “用户最近在搭建和调试新的记忆库 memory-gateway。” → `project`
+- “用户当前正在处理 Render 上游 SSL 和记忆提取 404 的问题。” → `issue`
+- “用户下一步要继续调试记忆提取。” → `todo`
 
 ## importance
 - 9-10：核心且长期稳定
@@ -224,11 +270,11 @@ CLASSIFY_IMPORT_PROMPT = """你是长期记忆结构化整理专家。
   }},
   {{
     "content": "原文B",
-    "importance": 6,
+    "importance": 8,
     "memory_type": "preference",
     "resolved": false,
-    "valence": 0.3,
-    "arousal": 0.2,
+    "valence": 0.2,
+    "arousal": 0.3,
     "project": ""
   }}
 ]
@@ -236,6 +282,24 @@ CLASSIFY_IMPORT_PROMPT = """你是长期记忆结构化整理专家。
 # 输入记忆
 {memories_text}
 """
+
+
+def _clean_memory_text(text: str) -> str:
+    text = str(text).strip()
+
+    # 去掉首尾空白后再剥外层引号
+    text = text.strip().strip('"').strip("'").strip()
+
+    # 去掉末尾多余逗号 / 中文逗号
+    text = re.sub(r'[,\uFF0C]+\s*$', '', text)
+
+    # 去掉再次包裹的引号
+    text = text.strip().strip('"').strip("'").strip()
+
+    # 合并多余空白
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    return text
 
 
 def _extract_json_array(text: str):
@@ -263,7 +327,7 @@ def _normalize_memory_item(mem: dict) -> dict | None:
     if not isinstance(mem, dict) or "content" not in mem:
         return None
 
-    content = str(mem.get("content", "")).strip()
+    content = _clean_memory_text(mem.get("content", ""))
     if not content:
         return None
 
@@ -357,7 +421,8 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
         return []
 
     if existing_memories:
-        memories_text = "\n".join(f"- {m}" for m in existing_memories)
+        cleaned_existing = [_clean_memory_text(m) for m in existing_memories if str(m).strip()]
+        memories_text = "\n".join(f"- {m}" for m in cleaned_existing)
     else:
         memories_text = "（暂无已知信息）"
 
@@ -375,10 +440,10 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": f"请从以下对话中提取新的记忆：\n\n{conversation_text}"},
             ],
-            max_tokens=1600,
+            max_tokens=1800,
         )
 
-        print(f"📝 记忆模型原始返回:\n{text[:1000]}", flush=True)
+        print(f"📝 记忆模型原始返回:\n{text[:1200]}", flush=True)
 
         memories = _extract_json_array(text)
         if not isinstance(memories, list):
@@ -405,11 +470,12 @@ async def score_memories(texts: List[str]) -> List[Dict]:
     if not texts:
         return []
 
-    memories_text = "\n".join(f"- {t}" for t in texts)
+    cleaned_texts = [_clean_memory_text(t) for t in texts if str(t).strip()]
+    memories_text = "\n".join(f"- {t}" for t in cleaned_texts)
     prompt = SCORING_PROMPT.format(memories_text=memories_text)
 
     print(
-        f"🧠 开始记忆评分: model={MEMORY_MODEL}, url={API_BASE_URL}, count={len(texts)}",
+        f"🧠 开始记忆评分: model={MEMORY_MODEL}, url={API_BASE_URL}, count={len(cleaned_texts)}",
         flush=True
     )
 
@@ -421,12 +487,12 @@ async def score_memories(texts: List[str]) -> List[Dict]:
 
         memories = _extract_json_array(text)
         if not isinstance(memories, list):
-            return [{"content": t, "importance": 5} for t in texts]
+            return [{"content": t, "importance": 5} for t in cleaned_texts]
 
         valid = []
         for mem in memories:
             if isinstance(mem, dict) and "content" in mem:
-                content = str(mem["content"]).strip()
+                content = _clean_memory_text(mem["content"])
                 if not content:
                     continue
                 try:
@@ -444,7 +510,7 @@ async def score_memories(texts: List[str]) -> List[Dict]:
 
     except Exception as e:
         print(f"⚠️ 记忆评分出错: {type(e).__name__}: {e}", flush=True)
-        return [{"content": t, "importance": 5} for t in texts]
+        return [{"content": t, "importance": 5} for t in cleaned_texts]
 
 
 async def classify_memory_texts(texts: List[str]) -> List[Dict]:
@@ -455,6 +521,12 @@ async def classify_memory_texts(texts: List[str]) -> List[Dict]:
     - 旧记忆重建
     """
     if not texts:
+        return []
+
+    cleaned_texts = [_clean_memory_text(t) for t in texts if str(t).strip()]
+    cleaned_texts = [t for t in cleaned_texts if t]
+
+    if not cleaned_texts:
         return []
 
     if not API_KEY:
@@ -469,13 +541,13 @@ async def classify_memory_texts(texts: List[str]) -> List[Dict]:
                 "arousal": 0.2,
                 "project": None,
             }
-            for t in texts
+            for t in cleaned_texts
         ]
 
-    memories_text = "\n".join(f"- {t}" for t in texts)
+    memories_text = "\n".join(f"- {t}" for t in cleaned_texts)
 
     print(
-        f"🧠 开始结构化分类: model={MEMORY_MODEL}, url={API_BASE_URL}, count={len(texts)}",
+        f"🧠 开始结构化分类: model={MEMORY_MODEL}, url={API_BASE_URL}, count={len(cleaned_texts)}",
         flush=True
     )
 
@@ -487,7 +559,7 @@ async def classify_memory_texts(texts: List[str]) -> List[Dict]:
             max_tokens=4000,
         )
 
-        print(f"📝 结构化分类原始返回:\n{text[:1200]}", flush=True)
+        print(f"📝 结构化分类原始返回:\n{text[:1600]}", flush=True)
 
         memories = _extract_json_array(text)
         if not isinstance(memories, list):
@@ -499,10 +571,10 @@ async def classify_memory_texts(texts: List[str]) -> List[Dict]:
             if normalized:
                 valid.append(normalized)
 
-        # 如果模型返回条数不一致，尽量兜底补齐
-        if len(valid) < len(texts):
+        # 条数不一致时兜底补齐
+        if len(valid) < len(cleaned_texts):
             existing_contents = {m["content"] for m in valid}
-            for t in texts:
+            for t in cleaned_texts:
                 if t not in existing_contents:
                     valid.append({
                         "content": t,
@@ -529,5 +601,5 @@ async def classify_memory_texts(texts: List[str]) -> List[Dict]:
                 "arousal": 0.2,
                 "project": None,
             }
-            for t in texts
+            for t in cleaned_texts
         ]
