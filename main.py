@@ -108,6 +108,10 @@ DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "")
 DEBUG_MAX_HISTORY = int(os.getenv("DEBUG_MAX_HISTORY", "20"))
 DEBUG_MAX_CONTENT_LEN = int(os.getenv("DEBUG_MAX_CONTENT_LEN", "3000"))
 
+BACKFILL_DEFAULT_LIMIT = int(os.getenv("BACKFILL_DEFAULT_LIMIT", "500"))
+BACKFILL_DEFAULT_BATCH_SIZE = int(os.getenv("BACKFILL_DEFAULT_BATCH_SIZE", "5"))
+BACKFILL_BATCH_SLEEP = float(os.getenv("BACKFILL_BATCH_SLEEP", "1.5"))
+
 
 def load_system_prompt():
     prompt_path = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
@@ -141,6 +145,27 @@ LATEST_DEBUG_SNAPSHOT = {
     "messages": [],
 }
 DEBUG_HISTORY = deque(maxlen=DEBUG_MAX_HISTORY)
+
+
+BACKFILL_STATE = {
+    "running": False,
+    "stop_requested": False,
+    "started_at": None,
+    "finished_at": None,
+    "limit": 0,
+    "batch_size": 0,
+    "only_unclassified": True,
+    "dry_run": False,
+    "fetched": 0,
+    "processed": 0,
+    "updated": 0,
+    "failed": 0,
+    "current_batch": 0,
+    "total_batches": 0,
+    "last_error": None,
+    "preview": [],
+}
+BACKFILL_TASK = None
 
 
 def _mask_headers_for_debug(headers: dict):
@@ -185,12 +210,31 @@ def _record_debug_snapshot(
 
 
 def _check_debug_auth(request: Request):
-    if not DEBUG_MODE:
-        return JSONResponse(status_code=403, content={"error": "DEBUG_MODE is disabled"})
-    token = request.headers.get("X-Debug-Token", "")
+    token = request.headers.get("X-Debug-Token", "") or request.query_params.get("token", "")
     if not DEBUG_TOKEN or token != DEBUG_TOKEN:
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     return None
+
+
+def _reset_backfill_state():
+    BACKFILL_STATE.update({
+        "running": False,
+        "stop_requested": False,
+        "started_at": None,
+        "finished_at": None,
+        "limit": 0,
+        "batch_size": 0,
+        "only_unclassified": True,
+        "dry_run": False,
+        "fetched": 0,
+        "processed": 0,
+        "updated": 0,
+        "failed": 0,
+        "current_batch": 0,
+        "total_batches": 0,
+        "last_error": None,
+        "preview": [],
+    })
 
 
 @asynccontextmanager
@@ -212,7 +256,7 @@ async def lifespan(app: FastAPI):
         await close_pool()
 
 
-app = FastAPI(title="AI Memory Gateway", version="2.9.0-anchor-backfill", lifespan=lifespan)
+app = FastAPI(title="AI Memory Gateway", version="3.0.0-async-backfill", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -347,6 +391,127 @@ async def process_memories_background(
         print(f"⚠️ 后台记忆处理失败: {type(e).__name__}: {e}")
 
 
+async def run_backfill_job(limit: int, batch_size: int, only_unclassified: bool, dry_run: bool):
+    global BACKFILL_TASK
+
+    try:
+        from database import get_memories_for_backfill, update_memory_structured
+        from memory_extractor import classify_memory_texts
+
+        _reset_backfill_state()
+        BACKFILL_STATE["running"] = True
+        BACKFILL_STATE["started_at"] = datetime.now().isoformat()
+        BACKFILL_STATE["limit"] = limit
+        BACKFILL_STATE["batch_size"] = batch_size
+        BACKFILL_STATE["only_unclassified"] = only_unclassified
+        BACKFILL_STATE["dry_run"] = dry_run
+
+        memories = await get_memories_for_backfill(limit=limit, only_unclassified=only_unclassified)
+        BACKFILL_STATE["fetched"] = len(memories)
+
+        if not memories:
+            BACKFILL_STATE["finished_at"] = datetime.now().isoformat()
+            BACKFILL_STATE["running"] = False
+            return
+
+        total_batches = (len(memories) + batch_size - 1) // batch_size
+        BACKFILL_STATE["total_batches"] = total_batches
+
+        for start in range(0, len(memories), batch_size):
+            if BACKFILL_STATE["stop_requested"]:
+                print("🛑 backfill 收到停止请求", flush=True)
+                break
+
+            batch = memories[start:start + batch_size]
+            texts = [m["content"] for m in batch]
+            BACKFILL_STATE["current_batch"] = start // batch_size + 1
+
+            print(
+                f"🔄 backfill 批次 {BACKFILL_STATE['current_batch']}/{total_batches} "
+                f"size={len(batch)}",
+                flush=True
+            )
+
+            try:
+                classified = await classify_memory_texts(texts)
+
+                result_map = {}
+                for item in classified:
+                    content = str(item.get("content", "")).strip()
+                    if content:
+                        result_map[content] = item
+
+                for mem in batch:
+                    if BACKFILL_STATE["stop_requested"]:
+                        break
+
+                    original_content = str(mem["content"]).strip()
+                    item = result_map.get(original_content)
+
+                    if not item:
+                        BACKFILL_STATE["failed"] += 1
+                        BACKFILL_STATE["preview"].append({
+                            "id": mem["id"],
+                            "content": original_content[:120],
+                            "status": "skipped_no_match",
+                        })
+                        continue
+
+                    row = {
+                        "id": mem["id"],
+                        "content": original_content,
+                        "importance": item.get("importance", 5),
+                        "memory_type": item.get("memory_type", "event"),
+                        "resolved": item.get("resolved", False),
+                        "valence": item.get("valence"),
+                        "arousal": item.get("arousal"),
+                        "project": item.get("project"),
+                    }
+
+                    if len(BACKFILL_STATE["preview"]) < 200:
+                        BACKFILL_STATE["preview"].append({
+                            "id": row["id"],
+                            "content": row["content"][:120],
+                            "importance": row["importance"],
+                            "memory_type": row["memory_type"],
+                            "resolved": row["resolved"],
+                            "valence": row["valence"],
+                            "arousal": row["arousal"],
+                            "project": row["project"],
+                            "status": "dry_run" if dry_run else "updated_pending",
+                        })
+
+                    if not dry_run:
+                        await update_memory_structured(
+                            memory_id=row["id"],
+                            importance=row["importance"],
+                            memory_type=row["memory_type"],
+                            resolved=row["resolved"],
+                            valence=row["valence"],
+                            arousal=row["arousal"],
+                            project=row["project"],
+                        )
+                        BACKFILL_STATE["updated"] += 1
+
+                    BACKFILL_STATE["processed"] += 1
+
+            except Exception as e:
+                BACKFILL_STATE["failed"] += len(batch)
+                BACKFILL_STATE["last_error"] = f"{type(e).__name__}: {e}"
+                print(f"⚠️ backfill 批次失败: {type(e).__name__}: {e}", flush=True)
+
+            await asyncio.sleep(BACKFILL_BATCH_SLEEP)
+
+    except Exception as e:
+        BACKFILL_STATE["last_error"] = f"{type(e).__name__}: {e}"
+        print(f"⚠️ backfill 总任务失败: {type(e).__name__}: {e}", flush=True)
+
+    finally:
+        BACKFILL_STATE["running"] = False
+        BACKFILL_STATE["finished_at"] = datetime.now().isoformat()
+        BACKFILL_TASK = None
+
+
 @app.get("/")
 async def health_check():
     memory_count = 0
@@ -358,13 +523,14 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "AI Memory Gateway v2.9.0-anchor-backfill",
+        "gateway": "AI Memory Gateway v3.0.0-async-backfill",
         "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
         "system_prompt_length": len(SYSTEM_PROMPT),
         "memory_enabled": MEMORY_ENABLED,
         "memory_count": memory_count,
         "memory_extract_interval": MEMORY_EXTRACT_INTERVAL,
         "debug_mode": DEBUG_MODE,
+        "backfill_running": BACKFILL_STATE["running"],
     }
 
 
@@ -889,124 +1055,85 @@ async def import_memories(request: Request):
         return {"error": str(e)}
 
 
-@app.get("/admin/backfill-memories")
-async def admin_backfill_memories(
+@app.get("/admin/backfill/start")
+async def admin_backfill_start(
     request: Request,
-    limit: int = 20,
-    batch_size: int = 10,
-    dry_run: bool = True,
+    limit: int = BACKFILL_DEFAULT_LIMIT,
+    batch_size: int = BACKFILL_DEFAULT_BATCH_SIZE,
+    dry_run: bool = False,
     all_memories: bool = False,
 ):
-    """
-    旧记忆结构化回填接口
-
-    用法示例：
-    /admin/backfill-memories?limit=20&batch_size=10&dry_run=true&token=xxxx
-    /admin/backfill-memories?limit=50&batch_size=10&dry_run=false&token=xxxx
-    /admin/backfill-memories?limit=100&batch_size=10&dry_run=false&all_memories=true&token=xxxx
-    """
+    global BACKFILL_TASK
 
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
 
-    token = request.headers.get("X-Debug-Token", "") or request.query_params.get("token", "")
-    if not DEBUG_TOKEN or token != DEBUG_TOKEN:
-        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    auth_err = _check_debug_auth(request)
+    if auth_err:
+        return auth_err
 
-    try:
-        from database import get_memories_for_backfill, update_memory_structured
-        from memory_extractor import classify_memory_texts
-
-        only_unclassified = not all_memories
-
-        memories = await get_memories_for_backfill(limit=limit, only_unclassified=only_unclassified)
-
-        if not memories:
-            return {
-                "status": "ok",
-                "message": "没有需要回填的旧记忆",
-                "updated": 0,
-                "dry_run": dry_run,
-            }
-
-        total_updated = 0
-        preview = []
-
-        for start in range(0, len(memories), batch_size):
-            batch = memories[start:start + batch_size]
-            texts = [m["content"] for m in batch]
-
-            classified = await classify_memory_texts(texts)
-
-            result_map = {}
-            for item in classified:
-                content = str(item.get("content", "")).strip()
-                if content:
-                    result_map[content] = item
-
-            for mem in batch:
-                original_content = str(mem["content"]).strip()
-                item = result_map.get(original_content)
-
-                if not item:
-                    preview.append({
-                        "id": mem["id"],
-                        "content": original_content[:100],
-                        "status": "skipped_no_match",
-                    })
-                    continue
-
-                row = {
-                    "id": mem["id"],
-                    "content": original_content,
-                    "importance": item.get("importance", 5),
-                    "memory_type": item.get("memory_type", "event"),
-                    "resolved": item.get("resolved", False),
-                    "valence": item.get("valence"),
-                    "arousal": item.get("arousal"),
-                    "project": item.get("project"),
-                }
-
-                preview.append({
-                    "id": row["id"],
-                    "content": row["content"][:120],
-                    "importance": row["importance"],
-                    "memory_type": row["memory_type"],
-                    "resolved": row["resolved"],
-                    "valence": row["valence"],
-                    "arousal": row["arousal"],
-                    "project": row["project"],
-                    "status": "dry_run" if dry_run else "updated",
-                })
-
-                if not dry_run:
-                    await update_memory_structured(
-                        memory_id=row["id"],
-                        importance=row["importance"],
-                        memory_type=row["memory_type"],
-                        resolved=row["resolved"],
-                        valence=row["valence"],
-                        arousal=row["arousal"],
-                        project=row["project"],
-                    )
-                    total_updated += 1
-
+    if BACKFILL_STATE["running"]:
         return {
-            "status": "ok",
-            "dry_run": dry_run,
-            "only_unclassified": only_unclassified,
-            "requested_limit": limit,
-            "batch_size": batch_size,
-            "fetched": len(memories),
-            "updated": total_updated,
-            "preview": preview[:100],
+            "status": "already_running",
+            "message": "已有 backfill 任务在运行",
+            "state": BACKFILL_STATE,
         }
 
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"{type(e).__name__}: {e}"}
+    only_unclassified = not all_memories
+    BACKFILL_TASK = asyncio.create_task(
+        run_backfill_job(
+            limit=max(1, limit),
+            batch_size=max(1, batch_size),
+            only_unclassified=only_unclassified,
+            dry_run=dry_run,
         )
+    )
+
+    return {
+        "status": "started",
+        "message": "backfill 已在后台启动",
+        "limit": limit,
+        "batch_size": batch_size,
+        "dry_run": dry_run,
+        "only_unclassified": only_unclassified,
+    }
+
+
+@app.get("/admin/backfill/status")
+async def admin_backfill_status(request: Request):
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+
+    auth_err = _check_debug_auth(request)
+    if auth_err:
+        return auth_err
+
+    return {
+        "status": "ok",
+        "state": BACKFILL_STATE,
+    }
+
+
+@app.get("/admin/backfill/stop")
+async def admin_backfill_stop(request: Request):
+    if not MEMORY_ENABLED:
+        return {"error": "记忆系统未启用"}
+
+    auth_err = _check_debug_auth(request)
+    if auth_err:
+        return auth_err
+
+    if not BACKFILL_STATE["running"]:
+        return {
+            "status": "idle",
+            "message": "当前没有运行中的 backfill 任务",
+        }
+
+    BACKFILL_STATE["stop_requested"] = True
+    return {
+        "status": "stopping",
+        "message": "已请求停止 backfill，当前批次结束后会停下",
+    }
 
 
 if __name__ == "__main__":
