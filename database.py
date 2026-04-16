@@ -493,3 +493,81 @@ async def delete_memories_batch(memory_ids: list):
             "DELETE FROM memories WHERE id = ANY($1::int[])",
             memory_ids
         )
+
+async def get_memories_for_backfill(limit: int = 50, only_unclassified: bool = True):
+    """
+    获取需要回填结构化字段的记忆。
+    only_unclassified=True 时，只取看起来还没被结构化过的旧记忆。
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if only_unclassified:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id, content, importance, source_session,
+                    memory_type, resolved, activation_count,
+                    pinned, valence, arousal, project, created_at
+                FROM memories
+                WHERE
+                    memory_type IS NULL
+                    OR valence IS NULL
+                    OR arousal IS NULL
+                    OR project IS NULL
+                    OR (memory_type = 'event' AND importance = 5 AND valence = 0 AND arousal = 0.2)
+                ORDER BY id
+                LIMIT $1
+                """,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id, content, importance, source_session,
+                    memory_type, resolved, activation_count,
+                    pinned, valence, arousal, project, created_at
+                FROM memories
+                ORDER BY id
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [dict(r) for r in rows]
+
+
+async def update_memory_structured(
+    memory_id: int,
+    importance: int,
+    memory_type: str,
+    resolved: bool,
+    valence: float = None,
+    arousal: float = None,
+    project: str = None,
+):
+    """
+    专门用于回填结构化字段。
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE memories
+            SET
+                importance = $1,
+                memory_type = $2,
+                resolved = $3,
+                valence = $4,
+                arousal = $5,
+                project = $6
+            WHERE id = $7
+            """,
+            importance,
+            memory_type,
+            resolved,
+            valence,
+            arousal,
+            project,
+            memory_id,
+        )
+
