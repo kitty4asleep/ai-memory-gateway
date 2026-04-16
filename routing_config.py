@@ -5,7 +5,7 @@ PROVIDERS = {
     "zhenhaoji": ("ZHENHAOJI_BASE_URL", "ZHENHAOJI_API_KEY"),  # https://api.zhenhaoji.qzz.io/v1/chat/completions
     "sunlea":    ("SUNLEA_BASE_URL",    "SUNLEA_API_KEY"),     # https://sunlea.de/v1/chat/completions
     "fuka":      ("FUKA_BASE_URL",      "FUKA_API_KEY"),       # https://api.fuka.win/v1/chat/completions
-    "qmbabyy":   ("QMBABYY_BASE_URL",   "QMBABYY_API_KEY"),    # https://qmbabyy.cn/v1/chat/completions
+    "kongbeiqie":   ("KBQ_BASE_URL",   "KBQ_API_KEY"),    # https://apicf.xn--lbr707ayot.cn/v1/chat/completions
  
     "run":    ("RUN_BASE_URL",    "RUN_API_KEY"),              # https://runanytime.hxi.me/v1/chat/completions
     "zyra":  ("ZYRA_BASE_URL",  "ZYRA_API_KEY"),               # https://zyraonline.org/v1/chat/completions
