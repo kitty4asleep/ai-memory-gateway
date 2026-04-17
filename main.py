@@ -11,6 +11,8 @@ AI Memory Gateway — 带记忆系统的 LLM 转发网关
 5) 相关记忆检索加入 arousal 权重
 6) 新增主动浮现记忆
 7) prompt 注入分为“相关记忆 + 主动浮现记忆”
+8) 主动浮现具体内容打印日志
+9) 打印最终注入片段，方便确认是否真的送上游
 """
 
 import os
@@ -79,12 +81,9 @@ def resolve_provider(model_name: str):
     }
 
 
-# =========================
-# 消息裁剪（工具链安全版）
-# =========================
-
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "8000"))
 SURFACE_MEMORY_COUNT = int(os.getenv("SURFACE_MEMORY_COUNT", "3"))
+DEBUG_INJECT_PREVIEW_CHARS = int(os.getenv("DEBUG_INJECT_PREVIEW_CHARS", "1200"))
 
 
 def _json_dump_safe(v: Any) -> str:
@@ -124,9 +123,6 @@ def _assistant_tool_call_ids(msg: Dict[str, Any]) -> Set[str]:
 
 
 def _drop_orphan_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    删除没有对应 assistant.tool_calls 的 tool message，避免上游 400。
-    """
     seen_tool_call_ids: Set[str] = set()
     for m in messages:
         if m.get("role") == "assistant":
@@ -150,9 +146,6 @@ def _drop_orphan_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str,
 
 
 def trim_messages_tool_aware(messages: List[Dict[str, Any]], limit: int = MAX_PROMPT_CHARS):
-    """
-    从尾部裁剪消息，优先保证 tool 链完整。
-    """
     system_msgs = [m for m in messages if m.get("role") == "system"]
     other_msgs = [m for m in messages if m.get("role") != "system"]
 
@@ -187,10 +180,6 @@ def trim_messages_tool_aware(messages: List[Dict[str, Any]], limit: int = MAX_PR
     kept = _drop_orphan_tool_messages(kept)
     return system_msgs + kept
 
-
-# =========================
-# 环境变量
-# =========================
 
 API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -377,7 +366,7 @@ async def lifespan(app: FastAPI):
         await close_pool()
 
 
-app = FastAPI(title="AI Memory Gateway", version="3.2.0-surface-memory", lifespan=lifespan)
+app = FastAPI(title="AI Memory Gateway", version="3.2.1-surface-visible", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -454,10 +443,23 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
 
 记忆是丰富对话的工具，而非对话焦点。
 """
+
         print(
             f"📚 注入相关记忆 {len(related_memories)} 条，主动浮现记忆 {len(surface_memories)} 条",
             flush=True,
         )
+
+        if surface_memories:
+            print("🌫️ 本轮实际注入的主动浮现记忆：", flush=True)
+            for mem in surface_memories:
+                print(f"   🌫️ id={mem['id']} | {str(mem['content'])[:100]}", flush=True)
+
+        preview = enhanced_prompt[:DEBUG_INJECT_PREVIEW_CHARS]
+        print("🧩 最终注入的 system prompt 预览：", flush=True)
+        print(preview, flush=True)
+        if len(enhanced_prompt) > DEBUG_INJECT_PREVIEW_CHARS:
+            print("... [SYSTEM PROMPT TRUNCATED IN LOG]", flush=True)
+
         return enhanced_prompt
 
     except Exception as e:
@@ -663,7 +665,7 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "AI Memory Gateway v3.2.0-surface-memory",
+        "gateway": "AI Memory Gateway v3.2.1-surface-visible",
         "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
         "system_prompt_length": len(SYSTEM_PROMPT),
         "memory_enabled": MEMORY_ENABLED,
@@ -1303,7 +1305,7 @@ if __name__ == "__main__":
             else f"每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次"
         )
     )
-    print(f"🌫️ 主动浮现记忆条数：{SURFACE_MEMORY_COUNT}")
+    print(f"🌫️ 主动浮现记忆条数上限：{SURFACE_MEMORY_COUNT}")
 
     if FORCE_STREAM:
         print("⚡ 强制流式传输：开启")
