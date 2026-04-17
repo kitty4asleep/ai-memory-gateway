@@ -1,11 +1,18 @@
 """
 AI Memory Gateway — 带记忆系统的 LLM 转发网关
+
 修复版：
 1) 工具链安全裁剪（避免 tool_call / tool output 断链）
 2) 自动清理孤儿 tool message
 3) debug 快照保留 tool 相关字段
 4) 上游流式报错把 body 细节透给前端
+
+第一步增强版：
+5) 相关记忆检索加入 arousal 权重
+6) 新增主动浮现记忆
+7) prompt 注入分为“相关记忆 + 主动浮现记忆”
 """
+
 import os
 import json
 import uuid
@@ -36,6 +43,7 @@ from database import (
     update_memory,
     delete_memory,
     delete_memories_batch,
+    get_surface_memories,
 )
 from memory_extractor import extract_memories, score_memories, classify_memory_texts
 from routing_config import PROVIDERS, MODEL_ROUTING, MODEL_ALIASES
@@ -74,7 +82,9 @@ def resolve_provider(model_name: str):
 # =========================
 # 消息裁剪（工具链安全版）
 # =========================
+
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "8000"))
+SURFACE_MEMORY_COUNT = int(os.getenv("SURFACE_MEMORY_COUNT", "3"))
 
 
 def _json_dump_safe(v: Any) -> str:
@@ -86,6 +96,7 @@ def _json_dump_safe(v: Any) -> str:
 
 def _message_size(msg: Dict[str, Any]) -> int:
     parts: List[str] = []
+
     content = msg.get("content")
     if content is not None:
         if isinstance(content, str):
@@ -95,10 +106,8 @@ def _message_size(msg: Dict[str, Any]) -> int:
 
     if msg.get("tool_calls"):
         parts.append(_json_dump_safe(msg.get("tool_calls")))
-
     if msg.get("tool_call_id"):
         parts.append(str(msg.get("tool_call_id")))
-
     if msg.get("function_call"):
         parts.append(_json_dump_safe(msg.get("function_call")))
 
@@ -116,8 +125,7 @@ def _assistant_tool_call_ids(msg: Dict[str, Any]) -> Set[str]:
 
 def _drop_orphan_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    删除没有对应 assistant.tool_calls 的 tool message，避免上游 400:
-    No tool call found for function call output with call_id ...
+    删除没有对应 assistant.tool_calls 的 tool message，避免上游 400。
     """
     seen_tool_call_ids: Set[str] = set()
     for m in messages:
@@ -126,6 +134,7 @@ def _drop_orphan_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str,
 
     cleaned: List[Dict[str, Any]] = []
     dropped = 0
+
     for m in messages:
         if m.get("role") == "tool":
             tcid = m.get("tool_call_id")
@@ -136,29 +145,26 @@ def _drop_orphan_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str,
 
     if dropped:
         print(f"⚠️ 清理孤儿 tool 消息 {dropped} 条", flush=True)
+
     return cleaned
 
 
 def trim_messages_tool_aware(messages: List[Dict[str, Any]], limit: int = MAX_PROMPT_CHARS):
     """
-    从尾部裁剪消息，优先保证 tool 链完整：
-    - 若保留了 role=tool，尽量保留它对应的 assistant.tool_calls
-    - 最后再做一次孤儿 tool 清理
+    从尾部裁剪消息，优先保证 tool 链完整。
     """
     system_msgs = [m for m in messages if m.get("role") == "system"]
     other_msgs = [m for m in messages if m.get("role") != "system"]
 
     kept_reversed: List[Dict[str, Any]] = []
     total = 0
-
-    # 若尾部保留了 tool 输出，则它依赖的 tool_call id 必须保留
     required_tool_call_ids: Set[str] = set()
 
     for msg in reversed(other_msgs):
         role = msg.get("role")
         size = _message_size(msg)
-
         must_keep = False
+
         if role == "tool":
             tcid = msg.get("tool_call_id")
             if tcid:
@@ -185,6 +191,7 @@ def trim_messages_tool_aware(messages: List[Dict[str, Any]], limit: int = MAX_PR
 # =========================
 # 环境变量
 # =========================
+
 API_KEY = os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "anthropic/claude-sonnet-4")
@@ -198,7 +205,6 @@ _round_counter = 0
 
 FORCE_STREAM = os.getenv("FORCE_STREAM", "false").lower() == "true"
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "")
-
 EXTRA_REFERER = os.getenv("EXTRA_REFERER", "https://ai-memory-gateway.local")
 EXTRA_TITLE = os.getenv("EXTRA_TITLE", "AI Memory Gateway")
 
@@ -221,6 +227,7 @@ def load_system_prompt():
                 return content
     except FileNotFoundError:
         pass
+
     print("ℹ️ 未找到 system_prompt.txt 或文件为空，将不注入 system prompt")
     return ""
 
@@ -230,6 +237,7 @@ if SYSTEM_PROMPT:
     print(f"✅ 人设已加载，长度：{len(SYSTEM_PROMPT)} 字符")
 else:
     print("ℹ️ 无人设，纯转发模式")
+
 
 LATEST_DEBUG_SNAPSHOT = {
     "updated_at": None,
@@ -275,15 +283,9 @@ def _truncate_debug_content(value: Any):
     if isinstance(value, str) and len(value) > DEBUG_MAX_CONTENT_LEN:
         return value[:DEBUG_MAX_CONTENT_LEN] + "...[TRUNCATED]"
     if isinstance(value, list):
-        out = []
-        for x in value:
-            out.append(_truncate_debug_content(x))
-        return out
+        return [_truncate_debug_content(x) for x in value]
     if isinstance(value, dict):
-        out = {}
-        for k, v in value.items():
-            out[k] = _truncate_debug_content(v)
-        return out
+        return {k: _truncate_debug_content(v) for k, v in value.items()}
     return value
 
 
@@ -375,7 +377,7 @@ async def lifespan(app: FastAPI):
         await close_pool()
 
 
-app = FastAPI(title="AI Memory Gateway", version="3.1.1-tool-safe", lifespan=lifespan)
+app = FastAPI(title="AI Memory Gateway", version="3.2.0-surface-memory", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -385,12 +387,18 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
         return SYSTEM_PROMPT
 
     try:
-        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
-        if not memories:
+        related_memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
+        related_ids = [m["id"] for m in related_memories]
+
+        surface_limit = max(0, min(SURFACE_MEMORY_COUNT, MAX_MEMORIES_INJECT))
+        surface_memories = []
+        if surface_limit > 0:
+            surface_memories = await get_surface_memories(limit=surface_limit, exclude_ids=related_ids)
+
+        if not related_memories and not surface_memories:
             return SYSTEM_PROMPT
 
-        memory_lines = []
-        for mem in memories:
+        def _format_memory_line(mem: dict) -> str:
             date_str = ""
             if mem.get("created_at"):
                 try:
@@ -410,30 +418,50 @@ async def build_system_prompt_with_memories(user_message: str) -> str:
                 extra.append("resolved=true")
             if mem.get("pinned") is True:
                 extra.append("pinned=true")
+            if mem.get("arousal") is not None:
+                try:
+                    extra.append(f"arousal={float(mem['arousal']):.2f}")
+                except Exception:
+                    pass
+
             meta = f" ({', '.join(extra)})" if extra else ""
+            return f"- {date_str}{mem['content']}{meta}"
 
-            memory_lines.append(f"- {date_str}{mem['content']}{meta}")
+        sections = []
 
-        memory_text = "\n".join(memory_lines)
+        if related_memories:
+            related_lines = "\n".join(_format_memory_line(mem) for mem in related_memories)
+            sections.append(f"【与当前话题相关的记忆】\n{related_lines}")
+
+        if surface_memories:
+            surface_lines = "\n".join(_format_memory_line(mem) for mem in surface_memories)
+            sections.append(f"【主动浮现的关键记忆】\n{surface_lines}")
+
+        memory_text = "\n\n".join(sections)
+
         enhanced_prompt = f"""{SYSTEM_PROMPT}
 
-【从过往对话中检索到的相关记忆】
 {memory_text}
 
 # 记忆应用
 - 像朋友般自然运用这些记忆，不刻意展示
-- 仅在相关话题出现时引用，避免主动提及
+- 仅在相关话题出现时引用，避免主动提及“我记得”
+- “与当前话题相关的记忆”优先用于当前回应
+- “主动浮现的关键记忆”用于维持连续性、照顾未解决问题和高重要背景
 - 对重要信息保持一致性；冲突以新信息为准
 - 模糊记忆可表达不确定性
 - 如果是未解决问题或持续中的项目，优先维持上下文连续性
 
 记忆是丰富对话的工具，而非对话焦点。
 """
-        print(f"📚 注入了 {len(memories)} 条相关记忆")
+        print(
+            f"📚 注入相关记忆 {len(related_memories)} 条，主动浮现记忆 {len(surface_memories)} 条",
+            flush=True,
+        )
         return enhanced_prompt
 
     except Exception as e:
-        print(f"⚠️ 记忆检索失败: {e}，使用纯人设")
+        print(f"⚠️ 记忆检索失败: {e}，使用纯人设", flush=True)
         return SYSTEM_PROMPT
 
 
@@ -445,6 +473,7 @@ async def process_memories_background(
     context_messages: list = None,
 ):
     global _round_counter
+
     try:
         await save_message(session_id, "user", user_msg, model)
         await save_message(session_id, "assistant", assistant_msg, model)
@@ -474,9 +503,10 @@ async def process_memories_background(
         new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
 
         META_BLACKLIST = [
-            "记忆库", "记忆系统", "检索", "没有被记录", "没有被提取", "记忆遗漏", "尚未被记录",
-            "写入不完整", "检索功能", "系统没有返回", "关键词匹配", "语义匹配", "语义检索",
-            "阈值", "数据库", "seed", "导入", "部署", "debug", "端口", "网关",
+            "记忆库", "记忆系统", "检索", "没有被记录", "没有被提取", "记忆遗漏",
+            "尚未被记录", "写入不完整", "检索功能", "系统没有返回", "关键词匹配",
+            "语义匹配", "语义检索", "阈值", "数据库", "seed", "导入", "部署",
+            "debug", "端口", "网关",
         ]
 
         filtered = []
@@ -509,6 +539,7 @@ async def process_memories_background(
 
 async def run_backfill_job(limit: int, batch_size: int, only_unclassified: bool, dry_run: bool):
     global BACKFILL_TASK
+
     try:
         from database import get_memories_for_backfill, update_memory_structured
 
@@ -539,7 +570,11 @@ async def run_backfill_job(limit: int, batch_size: int, only_unclassified: bool,
             batch = memories[start:start + batch_size]
             texts = [m["content"] for m in batch]
             BACKFILL_STATE["current_batch"] = start // batch_size + 1
-            print(f"🔄 backfill 批次 {BACKFILL_STATE['current_batch']}/{total_batches} size={len(batch)}", flush=True)
+
+            print(
+                f"🔄 backfill 批次 {BACKFILL_STATE['current_batch']}/{total_batches} size={len(batch)}",
+                flush=True,
+            )
 
             try:
                 classified = await classify_memory_texts(texts)
@@ -628,7 +663,7 @@ async def health_check():
 
     return {
         "status": "running",
-        "gateway": "AI Memory Gateway v3.1.1-tool-safe",
+        "gateway": "AI Memory Gateway v3.2.0-surface-memory",
         "system_prompt_loaded": len(SYSTEM_PROMPT) > 0,
         "system_prompt_length": len(SYSTEM_PROMPT),
         "memory_enabled": MEMORY_ENABLED,
@@ -684,7 +719,6 @@ async def chat_completions(request: Request):
     if enhanced and enhanced.strip():
         messages.insert(0, {"role": "system", "content": enhanced})
 
-    # 关键修复：工具链安全裁剪 + 清理孤儿 tool message
     body["messages"] = trim_messages_tool_aware(messages, MAX_PROMPT_CHARS)
 
     model = body.get("model", DEFAULT_MODEL) or DEFAULT_MODEL
@@ -692,6 +726,7 @@ async def chat_completions(request: Request):
     body["model"] = model
 
     session_id = str(uuid.uuid4())[:8]
+
     provider = resolve_provider(model)
     upstream_url = provider["base_url"]
     upstream_key = provider["api_key"]
@@ -699,6 +734,7 @@ async def chat_completions(request: Request):
 
     if not upstream_url:
         return JSONResponse(status_code=500, content={"error": f"上游 BASE_URL 未设置：model={model}"})
+
     if not upstream_key:
         return JSONResponse(
             status_code=500,
@@ -760,38 +796,44 @@ async def chat_completions(request: Request):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    # 非流式
     try:
         async with httpx.AsyncClient(timeout=300, verify=certifi.where()) as client:
             response = await client.post(upstream_url, headers=headers, json=body)
-            print(
-                f"📨 非流式上游响应: status={response.status_code}, url={upstream_url}, model={upstream_model}",
-                flush=True,
-            )
 
-            if response.status_code == 200:
-                resp_data = response.json()
-                assistant_msg = ""
-                try:
-                    assistant_msg = resp_data["choices"][0]["message"]["content"]
-                except (KeyError, IndexError, TypeError):
-                    pass
+        print(
+            f"📨 非流式上游响应: status={response.status_code}, url={upstream_url}, model={upstream_model}",
+            flush=True,
+        )
 
-                if MEMORY_ENABLED and user_message and assistant_msg:
-                    asyncio.create_task(
-                        process_memories_background(
-                            session_id, user_message, assistant_msg, model, context_messages=original_messages
-                        )
-                    )
-
-                return JSONResponse(status_code=200, content=resp_data)
-
-            print(f"⚠️ 非流式上游失败: status={response.status_code}, body={response.text[:1000]}", flush=True)
+        if response.status_code == 200:
+            resp_data = response.json()
+            assistant_msg = ""
             try:
-                err = response.json()
-            except Exception:
-                err = {"error": response.text}
-            return JSONResponse(status_code=response.status_code, content=err)
+                assistant_msg = resp_data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                pass
+
+            if MEMORY_ENABLED and user_message and assistant_msg:
+                asyncio.create_task(
+                    process_memories_background(
+                        session_id,
+                        user_message,
+                        assistant_msg,
+                        model,
+                        context_messages=original_messages,
+                    )
+                )
+
+            return JSONResponse(status_code=200, content=resp_data)
+
+        print(f"⚠️ 非流式上游失败: status={response.status_code}, body={response.text[:1000]}", flush=True)
+
+        try:
+            err = response.json()
+        except Exception:
+            err = {"error": response.text}
+
+        return JSONResponse(status_code=response.status_code, content=err)
 
     except Exception as e:
         print(f"⚠️ 非流式上游请求异常: {type(e).__name__}: {e}, url={upstream_url}", flush=True)
@@ -863,7 +905,11 @@ async def stream_and_capture(
     if MEMORY_ENABLED and user_message and assistant_msg:
         asyncio.create_task(
             process_memories_background(
-                session_id, user_message, assistant_msg, model, context_messages=original_messages
+                session_id,
+                user_message,
+                assistant_msg,
+                model,
+                context_messages=original_messages,
             )
         )
 
@@ -900,6 +946,7 @@ async def import_seed_memories():
 async def export_memories():
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用（设置 MEMORY_ENABLED=true 开启）"}
+
     try:
         memories = await get_all_memories()
         for mem in memories:
@@ -939,6 +986,7 @@ async def api_get_memories():
 async def api_update_memory(memory_id: int, request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
+
     data = await request.json()
     await update_memory(
         memory_id,
@@ -966,6 +1014,7 @@ async def api_delete_memory(memory_id: int):
 async def api_batch_update(request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
+
     data = await request.json()
     updates = data.get("updates", [])
     if not updates:
@@ -991,10 +1040,12 @@ async def api_batch_update(request: Request):
 async def api_batch_delete(request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
+
     data = await request.json()
     ids = data.get("ids", [])
     if not ids:
         return {"error": "未选择记忆"}
+
     await delete_memories_batch(ids)
     return {"status": "ok", "deleted": len(ids)}
 
@@ -1003,6 +1054,7 @@ async def api_batch_delete(request: Request):
 async def import_text_memories(request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用（设置 MEMORY_ENABLED=true 开启）"}
+
     try:
         data = await request.json()
         lines = data.get("lines", [])
@@ -1044,6 +1096,7 @@ async def import_text_memories(request: Request):
 
         imported = 0
         skipped = 0
+
         for mem in classified:
             content = mem.get("content", "")
             if not content:
@@ -1096,6 +1149,7 @@ async def import_memories(request: Request):
 
         raw_texts = []
         raw_items = []
+
         for mem in memories:
             content = str(mem.get("content", "")).strip()
             if not content:
@@ -1125,6 +1179,7 @@ async def import_memories(request: Request):
 
         imported = 0
         skipped = 0
+
         for mem in final_memories:
             content = mem.get("content", "")
             if not content:
@@ -1206,9 +1261,11 @@ async def admin_backfill_start(
 async def admin_backfill_status(request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
+
     auth_err = _check_debug_auth(request)
     if auth_err:
         return auth_err
+
     return {"status": "ok", "state": BACKFILL_STATE}
 
 
@@ -1216,6 +1273,7 @@ async def admin_backfill_status(request: Request):
 async def admin_backfill_stop(request: Request):
     if not MEMORY_ENABLED:
         return {"error": "记忆系统未启用"}
+
     auth_err = _check_debug_auth(request)
     if auth_err:
         return auth_err
@@ -1245,6 +1303,8 @@ if __name__ == "__main__":
             else f"每 {MEMORY_EXTRACT_INTERVAL} 轮提取一次"
         )
     )
+    print(f"🌫️ 主动浮现记忆条数：{SURFACE_MEMORY_COUNT}")
+
     if FORCE_STREAM:
         print("⚡ 强制流式传输：开启")
     if REASONING_EFFORT:
