@@ -28,6 +28,9 @@ WEIGHT_RECENCY = float(os.getenv("WEIGHT_RECENCY", "0.2"))
 WEIGHT_AROUSAL = float(os.getenv("WEIGHT_AROUSAL", "0.12"))
 MIN_SCORE_THRESHOLD = float(os.getenv("MIN_SCORE_THRESHOLD", "0.15"))
 
+# 主动浮现阈值
+SURFACE_MIN_SCORE = float(os.getenv("SURFACE_MIN_SCORE", "1.15"))
+
 
 # ============================================================
 # 连接池管理
@@ -165,6 +168,10 @@ _STOP_WORDS = frozenset({
     "虽然", "但是", "已经", "一个", "一些", "一下", "一点", "一起", "一样",
     "比较", "应该", "可能", "如果", "这个", "那个", "自己", "知道", "觉得",
     "感觉", "时候", "现在",
+    # 新增弱词 / 时间词 / 语气词
+    "今天", "昨天", "明天", "刚刚", "刚才", "最近", "刚", "这次", "那次",
+    "有点", "一点点", "一点儿", "一下子", "真的", "就是", "然后呢", "然后捏",
+    "累累", "嘟", "累累嘟", "呜呜", "嘿嘿", "宝宝", "宝贝", "老公",
 })
 
 
@@ -260,19 +267,9 @@ async def save_memory(
 
 
 async def search_memories(query: str, limit: int = 10):
-    """
-    搜索相关记忆 —— 中文友好的加权搜索
-
-    综合评分：
-    - 关键词命中
-    - importance
-    - recency
-    - unresolved bonus
-    - pinned bonus
-    - arousal bonus
-    """
     keywords = extract_search_keywords(query)
     if not keywords:
+        print(f"🔍 搜索 '{query}' → 提取不到有效关键词，跳过检索")
         return []
 
     pool = await get_pool()
@@ -368,6 +365,7 @@ async def get_surface_memories(limit: int = 3, exclude_ids: List[int] = None):
     """
     主动浮现记忆：
     不依赖当前 query，优先选择值得被“自然想起”的记忆。
+    现在加入最小 surface_score 阈值，避免每次机械拉满。
     """
     exclude_ids = exclude_ids or []
 
@@ -376,42 +374,71 @@ async def get_surface_memories(limit: int = 3, exclude_ids: List[int] = None):
         if exclude_ids:
             rows = await conn.fetch(
                 """
-                SELECT
-                    id, content, importance, memory_type, resolved, activation_count,
-                    pinned, valence, arousal, project, created_at, last_accessed
-                FROM memories
-                WHERE id != ALL($1::int[])
+                SELECT *
+                FROM (
+                    SELECT
+                        id, content, importance, memory_type, resolved, activation_count,
+                        pinned, valence, arousal, project, created_at, last_accessed,
+                        (
+                            0.35 * CASE WHEN pinned = TRUE THEN 1 ELSE 0 END
+                            + 0.30 * CASE WHEN resolved = FALSE THEN 1 ELSE 0 END
+                            + 0.20 * COALESCE(arousal, 0)
+                            + 0.10 * (importance::float / 10.0)
+                            + 0.05 * LEAST(COALESCE(activation_count, 0), 10)::float / 10.0
+                        ) AS surface_score
+                    FROM memories
+                    WHERE id != ALL($1::int[])
+                ) t
+                WHERE surface_score >= $2
                 ORDER BY
-                    CASE WHEN pinned = TRUE THEN 1 ELSE 0 END DESC,
-                    CASE WHEN resolved = FALSE THEN 1 ELSE 0 END DESC,
-                    COALESCE(arousal, 0) DESC,
-                    importance DESC,
-                    COALESCE(activation_count, 0) DESC,
+                    surface_score DESC,
                     COALESCE(last_accessed, created_at) DESC
-                LIMIT $2
+                LIMIT $3
                 """,
                 exclude_ids,
+                SURFACE_MIN_SCORE,
                 limit,
             )
         else:
             rows = await conn.fetch(
                 """
-                SELECT
-                    id, content, importance, memory_type, resolved, activation_count,
-                    pinned, valence, arousal, project, created_at, last_accessed
-                FROM memories
+                SELECT *
+                FROM (
+                    SELECT
+                        id, content, importance, memory_type, resolved, activation_count,
+                        pinned, valence, arousal, project, created_at, last_accessed,
+                        (
+                            0.35 * CASE WHEN pinned = TRUE THEN 1 ELSE 0 END
+                            + 0.30 * CASE WHEN resolved = FALSE THEN 1 ELSE 0 END
+                            + 0.20 * COALESCE(arousal, 0)
+                            + 0.10 * (importance::float / 10.0)
+                            + 0.05 * LEAST(COALESCE(activation_count, 0), 10)::float / 10.0
+                        ) AS surface_score
+                    FROM memories
+                ) t
+                WHERE surface_score >= $1
                 ORDER BY
-                    CASE WHEN pinned = TRUE THEN 1 ELSE 0 END DESC,
-                    CASE WHEN resolved = FALSE THEN 1 ELSE 0 END DESC,
-                    COALESCE(arousal, 0) DESC,
-                    importance DESC,
-                    COALESCE(activation_count, 0) DESC,
+                    surface_score DESC,
                     COALESCE(last_accessed, created_at) DESC
-                LIMIT $1
+                LIMIT $2
                 """,
+                SURFACE_MIN_SCORE,
                 limit,
             )
-        return [dict(r) for r in rows]
+
+        results = [dict(r) for r in rows]
+        if results:
+            print(f"🌫️ 主动浮现候选命中 {len(results)} 条（阈值={SURFACE_MIN_SCORE}）")
+            for r in results:
+                print(
+                    f"   🌫️ [surface={r['surface_score']:.3f}] "
+                    f"(imp={r['importance']}, resolved={r['resolved']}, pinned={r['pinned']}, "
+                    f"arousal={r['arousal']}) {r['content'][:70]}..."
+                )
+        else:
+            print(f"🌫️ 主动浮现候选 0 条（阈值={SURFACE_MIN_SCORE}）")
+
+        return results
 
 
 async def get_recent_memories(limit: int = 20):
