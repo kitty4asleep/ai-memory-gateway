@@ -7,6 +7,7 @@
 - 存储对话记录
 - 存储/检索记忆（带中文分词和加权排序）
 - 旧记忆结构化回填
+- 主动浮现记忆
 """
 
 import os
@@ -20,10 +21,11 @@ import jieba.analyse
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# 搜索权重（向量搜索加入后可重新分配）
+# 搜索权重
 WEIGHT_KEYWORD = float(os.getenv("WEIGHT_KEYWORD", "0.5"))
 WEIGHT_IMPORTANCE = float(os.getenv("WEIGHT_IMPORTANCE", "0.3"))
 WEIGHT_RECENCY = float(os.getenv("WEIGHT_RECENCY", "0.2"))
+WEIGHT_AROUSAL = float(os.getenv("WEIGHT_AROUSAL", "0.12"))
 MIN_SCORE_THRESHOLD = float(os.getenv("MIN_SCORE_THRESHOLD", "0.15"))
 
 
@@ -94,7 +96,6 @@ async def init_tables():
             );
         """)
 
-        # v2 第一阶段扩字段：不推翻旧表，直接增量升级
         await conn.execute("""
             ALTER TABLE memories
             ADD COLUMN IF NOT EXISTS memory_type TEXT DEFAULT 'event';
@@ -153,7 +154,6 @@ jieba.setLogLevel(jieba.logging.INFO)
 EN_WORD_PATTERN = re.compile(r'[a-zA-Z][a-zA-Z0-9_./-]*')
 NUM_PATTERN = re.compile(r'\d{2,}')
 
-# 中文停用词（高频但无搜索价值的词）
 _STOP_WORDS = frozenset({
     "的", "了", "在", "是", "我", "你", "他", "她", "它", "们", "这", "那",
     "有", "和", "与", "也", "都", "又", "就", "但", "而", "或", "到", "被",
@@ -169,37 +169,25 @@ _STOP_WORDS = frozenset({
 
 
 def extract_search_keywords(query: str) -> List[str]:
-    """
-    从查询中提取搜索关键词（使用 jieba 分词）
-
-    中文：用 jieba 分词后过滤停用词和单字
-    英文：按正则提取完整单词
-    数字：保留2位及以上的数字串
-    """
     keywords = set()
 
-    # 英文单词（2字符以上）
     for match in EN_WORD_PATTERN.finditer(query):
         word = match.group().strip()
         if len(word) >= 2:
             keywords.add(word)
 
-    # 数字串（年份、日期等）
     for match in NUM_PATTERN.finditer(query):
         keywords.add(match.group())
 
-    # 中文分词（jieba）
     words = jieba.cut(query, cut_all=False)
     for word in words:
         word = word.strip()
         if not word:
             continue
 
-        # 跳过纯英文/数字（已在上面处理）
         if EN_WORD_PATTERN.fullmatch(word) or NUM_PATTERN.fullmatch(word):
             continue
 
-        # 跳过单字和停用词
         if len(word) < 2 or word in _STOP_WORDS:
             continue
 
@@ -281,6 +269,7 @@ async def search_memories(query: str, limit: int = 10):
     - recency
     - unresolved bonus
     - pinned bonus
+    - arousal bonus
     """
     keywords = extract_search_keywords(query)
     if not keywords:
@@ -324,6 +313,7 @@ async def search_memories(query: str, limit: int = 10):
                     + {WEIGHT_RECENCY} * (1.0 / (1.0 + EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0))
                     + 0.10 * CASE WHEN resolved = FALSE THEN 1 ELSE 0 END
                     + 0.15 * CASE WHEN pinned = TRUE THEN 1 ELSE 0 END
+                    + {WEIGHT_AROUSAL} * COALESCE(arousal, 0)
                 ) AS score
             FROM memories
             WHERE {where_clause}
@@ -350,7 +340,8 @@ async def search_memories(query: str, limit: int = 10):
                 print(
                     f"   📌 [score={r['score']:.3f}] "
                     f"(hits={r['hit_count']}, imp={r['importance']}, "
-                    f"type={r.get('memory_type')}, resolved={r.get('resolved')}, pinned={r.get('pinned')}) "
+                    f"type={r.get('memory_type')}, resolved={r.get('resolved')}, "
+                    f"pinned={r.get('pinned')}, arousal={r.get('arousal')}) "
                     f"{r['content'][:60]}..."
                 )
 
@@ -371,6 +362,56 @@ async def search_memories(query: str, limit: int = 10):
             )
 
         return results
+
+
+async def get_surface_memories(limit: int = 3, exclude_ids: List[int] = None):
+    """
+    主动浮现记忆：
+    不依赖当前 query，优先选择值得被“自然想起”的记忆。
+    """
+    exclude_ids = exclude_ids or []
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if exclude_ids:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id, content, importance, memory_type, resolved, activation_count,
+                    pinned, valence, arousal, project, created_at, last_accessed
+                FROM memories
+                WHERE id != ALL($1::int[])
+                ORDER BY
+                    CASE WHEN pinned = TRUE THEN 1 ELSE 0 END DESC,
+                    CASE WHEN resolved = FALSE THEN 1 ELSE 0 END DESC,
+                    COALESCE(arousal, 0) DESC,
+                    importance DESC,
+                    COALESCE(activation_count, 0) DESC,
+                    COALESCE(last_accessed, created_at) DESC
+                LIMIT $2
+                """,
+                exclude_ids,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id, content, importance, memory_type, resolved, activation_count,
+                    pinned, valence, arousal, project, created_at, last_accessed
+                FROM memories
+                ORDER BY
+                    CASE WHEN pinned = TRUE THEN 1 ELSE 0 END DESC,
+                    CASE WHEN resolved = FALSE THEN 1 ELSE 0 END DESC,
+                    COALESCE(arousal, 0) DESC,
+                    importance DESC,
+                    COALESCE(activation_count, 0) DESC,
+                    COALESCE(last_accessed, created_at) DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [dict(r) for r in rows]
 
 
 async def get_recent_memories(limit: int = 20):
@@ -397,7 +438,6 @@ async def get_all_memories_count():
 
 
 async def get_all_memories():
-    """导出所有记忆（用于备份）"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
@@ -412,7 +452,6 @@ async def get_all_memories():
 
 
 async def get_all_memories_detail():
-    """获取所有记忆（含 id，用于管理页面）"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
@@ -437,7 +476,6 @@ async def update_memory(
     arousal: float = None,
     project: str = None,
 ):
-    """更新单条记忆"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         fields = []
@@ -488,20 +526,17 @@ async def update_memory(
             return
 
         values.append(memory_id)
-
         sql = f"UPDATE memories SET {', '.join(fields)} WHERE id = ${idx}"
         await conn.execute(sql, *values)
 
 
 async def delete_memory(memory_id: int):
-    """删除单条记忆"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM memories WHERE id = $1", memory_id)
 
 
 async def delete_memories_batch(memory_ids: list):
-    """批量删除记忆"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -515,10 +550,6 @@ async def delete_memories_batch(memory_ids: list):
 # ============================================================
 
 async def get_memories_for_backfill(limit: int = 50, only_unclassified: bool = True):
-    """
-    获取需要回填结构化字段的记忆。
-    现在优先依赖 backfilled_at，避免重复抓取已经处理过的旧记忆。
-    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         if only_unclassified:
@@ -561,10 +592,6 @@ async def update_memory_structured(
     project: str = None,
     mark_backfilled: bool = True,
 ):
-    """
-    专门用于回填结构化字段。
-    更新结构化字段，并可选写入 backfilled_at。
-    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         if mark_backfilled:
