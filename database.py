@@ -6,12 +6,12 @@
 - 存储对话记录
 - 存储/检索记忆（带中文分词和加权排序）
 - 旧记忆结构化回填
-- 主动浮现记忆（强浮现 + 保底浮现）
+- 主动浮现记忆（强浮现 + 真保底浮现）
 """
 
 import os
 import re
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import asyncpg
 import jieba
@@ -33,10 +33,10 @@ MIN_SCORE_THRESHOLD = float(os.getenv("MIN_SCORE_THRESHOLD", "0.15"))
 # 主动浮现阈值
 # ============================================================
 
-SURFACE_MIN_SCORE = float(os.getenv("SURFACE_MIN_SCORE", "0.95"))
-SURFACE_STRONG_MIN_SCORE = float(os.getenv("SURFACE_STRONG_MIN_SCORE", "1.15"))
-SURFACE_FALLBACK_MIN_SCORE = float(os.getenv("SURFACE_FALLBACK_MIN_SCORE", "0.60"))
+SURFACE_STRONG_MIN_SCORE = float(os.getenv("SURFACE_STRONG_MIN_SCORE", "1.00"))
+SURFACE_FALLBACK_SOFT_MIN_SCORE = float(os.getenv("SURFACE_FALLBACK_SOFT_MIN_SCORE", "0.45"))
 SURFACE_FALLBACK_MAX = int(os.getenv("SURFACE_FALLBACK_MAX", "2"))
+SURFACE_FORCE_MIN = int(os.getenv("SURFACE_FORCE_MIN", "1"))
 
 # ============================================================
 # 连接池管理
@@ -148,13 +148,14 @@ async def init_tables():
 
 
 # ============================================================
-# 中文分词工具（基于 jieba）
+# 中文分词工具
 # ============================================================
 
 jieba.setLogLevel(jieba.logging.INFO)
 
 EN_WORD_PATTERN = re.compile(r'[a-zA-Z][a-zA-Z0-9_./-]*')
 NUM_PATTERN = re.compile(r'\d{2,}')
+CJK_REPEAT_PATTERN = re.compile(r'([\u4e00-\u9fff]{1,2})\1')
 
 _STOP_WORDS = frozenset({
     "的", "了", "在", "是", "我", "你", "他", "她", "它", "们",
@@ -169,41 +170,35 @@ _STOP_WORDS = frozenset({
     "已经", "一个", "一些", "一下", "一点", "一起", "一样", "比较",
     "应该", "可能", "如果", "这个", "那个", "自己", "知道", "觉得", "感觉",
     "时候", "现在",
-
-    # 时间 / 语气 / 黏连型弱词
     "今天", "昨天", "明天", "刚刚", "刚才", "最近", "刚", "这次", "那次",
     "有点", "一点点", "一点儿", "一下子", "真的", "就是",
     "然后呢", "然后捏",
     "累累", "嘟", "累累嘟", "呜呜", "嘿嘿",
-
-    # 称呼
     "宝宝", "宝贝", "老公",
-
-    # 你这轮特别要压的泛词
     "继续", "一直", "还有", "想要",
+    "哥哥", "姐姐",
 })
 
+# 注意：这里不再把“亲亲/抱抱/啃啃”等亲密动作词列为弱词
 _WEAK_WORDS = frozenset({
     "继续", "一直", "还是", "还有", "可以", "想要", "要", "想",
     "看看", "说说", "聊聊", "做做", "弄弄", "等等", "然后", "就是",
     "现在", "今天", "最近", "刚刚", "刚才",
     "一下", "一点", "有点",
-    "抱着", "抱抱", "亲亲", "乖乖",
 })
-
-_EMOTIONALLY_VAGUE_PHRASES = (
-    "继续",
-    "还要",
-    "还想",
-    "想要",
-    "可以吗",
-    "行不行",
-    "要不要",
-)
 
 
 def _normalize_keyword(word: str) -> str:
     return word.strip().lower()
+
+
+def _extract_repeat_words(query: str) -> List[str]:
+    found = set()
+    for m in CJK_REPEAT_PATTERN.finditer(query):
+        token = m.group(0).strip()
+        if len(token) >= 2:
+            found.add(token)
+    return list(found)
 
 
 def _is_weak_keyword(word: str) -> bool:
@@ -212,25 +207,22 @@ def _is_weak_keyword(word: str) -> bool:
         return True
     if w in _WEAK_WORDS:
         return True
-    if len(w) <= 2 and w not in {"ai", "db", "ui", "py"}:
+    if len(w) == 1:
         return True
     return False
 
 
-def _should_skip_search(query: str, keywords: List[str]) -> (bool, str):
+def _should_skip_search(query: str, keywords: List[str]) -> Tuple[bool, str]:
     if not keywords:
         return True, "无有效关键词"
+
+    non_weak = [kw for kw in keywords if not _is_weak_keyword(kw)]
 
     if len(keywords) == 1 and _is_weak_keyword(keywords[0]):
         return True, f"仅剩单个弱关键词: {keywords[0]}"
 
-    non_weak = [kw for kw in keywords if not _is_weak_keyword(kw)]
     if not non_weak:
         return True, f"关键词全部偏弱: {keywords}"
-
-    q = query.strip()
-    if len(q) <= 8 and any(p in q for p in _EMOTIONALLY_VAGUE_PHRASES) and not non_weak:
-        return True, "短句且为情绪/黏连型泛表达"
 
     return False, ""
 
@@ -246,6 +238,12 @@ def extract_search_keywords(query: str) -> List[str]:
     for match in NUM_PATTERN.finditer(query):
         keywords.add(match.group())
 
+    # 先补抓“啃啃/抱抱/亲亲”这类叠词
+    for token in _extract_repeat_words(query):
+        token = _normalize_keyword(token)
+        if len(token) >= 2 and token not in _STOP_WORDS:
+            keywords.add(token)
+
     words = jieba.cut(query, cut_all=False)
     for word in words:
         word = _normalize_keyword(word)
@@ -257,7 +255,6 @@ def extract_search_keywords(query: str) -> List[str]:
             continue
         keywords.add(word)
 
-    # 稳定输出，方便日志观察
     result = sorted(keywords, key=lambda x: (-len(x), x))
     return result
 
@@ -417,66 +414,67 @@ def _dedupe_memory_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 async def get_surface_memories(limit: int = 3, exclude_ids: List[int] = None):
     """
-    主动浮现记忆：双层策略
-    1) 强浮现：优先 unresolved / pinned / 高 arousal / 高 importance
-    2) 保底浮现：当强浮现不足时，补最近且重要的记忆，但不机械拉满
+    主动浮现记忆：
+    1. 强浮现：重要、未解决、pinned、高 arousal
+    2. 柔性保底：如果强浮现不足，补最近重要项
+    3. 真保底：如果还没有，强制补至少 1 条最近/重要/pinned/unresolved
     """
     exclude_ids = exclude_ids or []
     pool = await get_pool()
 
     async with pool.acquire() as conn:
-        strong_where_exclude = ""
-        fallback_where_exclude = ""
-        params_strong: List[Any] = []
-        params_fallback: List[Any] = []
-
+        # ---------------------------
+        # 强浮现
+        # ---------------------------
         if exclude_ids:
-            strong_where_exclude = "WHERE id != ALL($1::int[])"
-            fallback_where_exclude = "WHERE id != ALL($1::int[])"
-            params_strong.append(exclude_ids)
-            params_fallback.append(exclude_ids)
-
-            strong_min_idx = 2
-            strong_limit_idx = 3
-            fallback_min_idx = 2
-            fallback_limit_idx = 3
+            strong_rows = await conn.fetch("""
+                SELECT * FROM (
+                    SELECT
+                        id, content, importance, memory_type, resolved, activation_count,
+                        pinned, valence, arousal, project, created_at, last_accessed,
+                        (
+                            0.35 * CASE WHEN pinned = TRUE THEN 1 ELSE 0 END
+                            + 0.28 * CASE WHEN resolved = FALSE THEN 1 ELSE 0 END
+                            + 0.17 * COALESCE(arousal, 0)
+                            + 0.12 * (importance::float / 10.0)
+                            + 0.08 * LEAST(COALESCE(activation_count, 0), 10)::float / 10.0
+                            + 0.08 * (
+                                1.0 / (1.0 + EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0)
+                            )
+                        ) AS surface_score
+                    FROM memories
+                    WHERE id != ALL($1::int[])
+                ) t
+                WHERE surface_score >= $2
+                ORDER BY surface_score DESC, COALESCE(last_accessed, created_at) DESC, importance DESC
+                LIMIT $3
+            """, exclude_ids, SURFACE_STRONG_MIN_SCORE, limit)
         else:
-            strong_min_idx = 1
-            strong_limit_idx = 2
-            fallback_min_idx = 1
-            fallback_limit_idx = 2
+            strong_rows = await conn.fetch("""
+                SELECT * FROM (
+                    SELECT
+                        id, content, importance, memory_type, resolved, activation_count,
+                        pinned, valence, arousal, project, created_at, last_accessed,
+                        (
+                            0.35 * CASE WHEN pinned = TRUE THEN 1 ELSE 0 END
+                            + 0.28 * CASE WHEN resolved = FALSE THEN 1 ELSE 0 END
+                            + 0.17 * COALESCE(arousal, 0)
+                            + 0.12 * (importance::float / 10.0)
+                            + 0.08 * LEAST(COALESCE(activation_count, 0), 10)::float / 10.0
+                            + 0.08 * (
+                                1.0 / (1.0 + EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0)
+                            )
+                        ) AS surface_score
+                    FROM memories
+                ) t
+                WHERE surface_score >= $1
+                ORDER BY surface_score DESC, COALESCE(last_accessed, created_at) DESC, importance DESC
+                LIMIT $2
+            """, SURFACE_STRONG_MIN_SCORE, limit)
 
-        params_strong.extend([SURFACE_STRONG_MIN_SCORE, limit])
-
-        strong_sql = f"""
-            SELECT * FROM (
-                SELECT
-                    id, content, importance, memory_type, resolved, activation_count,
-                    pinned, valence, arousal, project, created_at, last_accessed,
-                    (
-                        0.38 * CASE WHEN pinned = TRUE THEN 1 ELSE 0 END
-                        + 0.28 * CASE WHEN resolved = FALSE THEN 1 ELSE 0 END
-                        + 0.18 * COALESCE(arousal, 0)
-                        + 0.10 * (importance::float / 10.0)
-                        + 0.06 * LEAST(COALESCE(activation_count, 0), 10)::float / 10.0
-                    ) AS surface_score
-                FROM memories
-                {strong_where_exclude}
-            ) t
-            WHERE surface_score >= ${strong_min_idx}
-            ORDER BY
-                surface_score DESC,
-                COALESCE(last_accessed, created_at) DESC,
-                importance DESC
-            LIMIT ${strong_limit_idx}
-        """
-
-        strong_rows = [dict(r) for r in await conn.fetch(strong_sql, *params_strong)]
-
-        print(
-            f"🌫️ 强浮现候选 {len(strong_rows)} 条（阈值={SURFACE_STRONG_MIN_SCORE}）"
-        )
-        for r in strong_rows:
+        strong = [dict(r) for r in strong_rows]
+        print(f"🌫️ 强浮现候选 {len(strong)} 条（阈值={SURFACE_STRONG_MIN_SCORE}）")
+        for r in strong:
             print(
                 f" 🌫️ [strong={r['surface_score']:.3f}] "
                 f"(imp={r['importance']}, resolved={r['resolved']}, pinned={r['pinned']}, "
@@ -484,59 +482,70 @@ async def get_surface_memories(limit: int = 3, exclude_ids: List[int] = None):
                 f"{r['content'][:70]}..."
             )
 
-        if len(strong_rows) >= limit:
-            return strong_rows[:limit]
+        if len(strong) >= limit:
+            print(f"🌫️ 主动浮现最终返回 {len(strong[:limit])} 条（全来自强浮现）")
+            return strong[:limit]
 
-        remain = limit - len(strong_rows)
+        # ---------------------------
+        # 柔性保底
+        # ---------------------------
+        remain = limit - len(strong)
         fallback_limit = min(remain, SURFACE_FALLBACK_MAX)
-        if fallback_limit <= 0:
-            return strong_rows
+        strong_ids = [r["id"] for r in strong]
+        fallback_exclude = list(set(exclude_ids + strong_ids))
 
-        exclude_for_fallback = list(exclude_ids) + [r["id"] for r in strong_rows]
-
-        if exclude_for_fallback:
-            params_fallback = [exclude_for_fallback, SURFACE_FALLBACK_MIN_SCORE, fallback_limit]
-            fallback_min_idx = 2
-            fallback_limit_idx = 3
-            fallback_where = "WHERE id != ALL($1::int[])"
+        if fallback_limit > 0:
+            if fallback_exclude:
+                fallback_rows = await conn.fetch("""
+                    SELECT * FROM (
+                        SELECT
+                            id, content, importance, memory_type, resolved, activation_count,
+                            pinned, valence, arousal, project, created_at, last_accessed,
+                            (
+                                0.24 * CASE WHEN pinned = TRUE THEN 1 ELSE 0 END
+                                + 0.22 * CASE WHEN resolved = FALSE THEN 1 ELSE 0 END
+                                + 0.20 * (importance::float / 10.0)
+                                + 0.12 * COALESCE(arousal, 0)
+                                + 0.12 * (
+                                    1.0 / (1.0 + EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0)
+                                )
+                                + 0.10 * LEAST(COALESCE(activation_count, 0), 10)::float / 10.0
+                            ) AS surface_score
+                        FROM memories
+                        WHERE id != ALL($1::int[])
+                    ) t
+                    WHERE surface_score >= $2
+                    ORDER BY surface_score DESC, created_at DESC, importance DESC
+                    LIMIT $3
+                """, fallback_exclude, SURFACE_FALLBACK_SOFT_MIN_SCORE, fallback_limit)
+            else:
+                fallback_rows = await conn.fetch("""
+                    SELECT * FROM (
+                        SELECT
+                            id, content, importance, memory_type, resolved, activation_count,
+                            pinned, valence, arousal, project, created_at, last_accessed,
+                            (
+                                0.24 * CASE WHEN pinned = TRUE THEN 1 ELSE 0 END
+                                + 0.22 * CASE WHEN resolved = FALSE THEN 1 ELSE 0 END
+                                + 0.20 * (importance::float / 10.0)
+                                + 0.12 * COALESCE(arousal, 0)
+                                + 0.12 * (
+                                    1.0 / (1.0 + EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0)
+                                )
+                                + 0.10 * LEAST(COALESCE(activation_count, 0), 10)::float / 10.0
+                            ) AS surface_score
+                        FROM memories
+                    ) t
+                    WHERE surface_score >= $1
+                    ORDER BY surface_score DESC, created_at DESC, importance DESC
+                    LIMIT $2
+                """, SURFACE_FALLBACK_SOFT_MIN_SCORE, fallback_limit)
         else:
-            params_fallback = [SURFACE_FALLBACK_MIN_SCORE, fallback_limit]
-            fallback_min_idx = 1
-            fallback_limit_idx = 2
-            fallback_where = ""
+            fallback_rows = []
 
-        fallback_sql = f"""
-            SELECT * FROM (
-                SELECT
-                    id, content, importance, memory_type, resolved, activation_count,
-                    pinned, valence, arousal, project, created_at, last_accessed,
-                    (
-                        0.22 * CASE WHEN pinned = TRUE THEN 1 ELSE 0 END
-                        + 0.20 * CASE WHEN resolved = FALSE THEN 1 ELSE 0 END
-                        + 0.20 * (importance::float / 10.0)
-                        + 0.15 * COALESCE(arousal, 0)
-                        + 0.13 * (
-                            1.0 / (1.0 + EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0)
-                        )
-                        + 0.10 * LEAST(COALESCE(activation_count, 0), 10)::float / 10.0
-                    ) AS surface_score
-                FROM memories
-                {fallback_where}
-            ) t
-            WHERE surface_score >= ${fallback_min_idx}
-            ORDER BY
-                surface_score DESC,
-                created_at DESC,
-                importance DESC
-            LIMIT ${fallback_limit_idx}
-        """
-
-        fallback_rows = [dict(r) for r in await conn.fetch(fallback_sql, *params_fallback)]
-
-        print(
-            f"🌫️ 保底浮现候选 {len(fallback_rows)} 条（阈值={SURFACE_FALLBACK_MIN_SCORE}，最多补 {fallback_limit} 条）"
-        )
-        for r in fallback_rows:
+        fallback = [dict(r) for r in fallback_rows]
+        print(f"🌫️ 保底浮现候选 {len(fallback)} 条（阈值={SURFACE_FALLBACK_SOFT_MIN_SCORE}，最多补 {fallback_limit} 条）")
+        for r in fallback:
             print(
                 f" 🌫️ [fallback={r['surface_score']:.3f}] "
                 f"(imp={r['importance']}, resolved={r['resolved']}, pinned={r['pinned']}, "
@@ -544,17 +553,66 @@ async def get_surface_memories(limit: int = 3, exclude_ids: List[int] = None):
                 f"{r['content'][:70]}..."
             )
 
-        final_rows = _dedupe_memory_rows(strong_rows + fallback_rows)
+        merged = _dedupe_memory_rows(strong + fallback)
 
-        if not final_rows:
-            print(
-                f"🌫️ 主动浮现最终 0 条（strong阈值={SURFACE_STRONG_MIN_SCORE}, "
-                f"fallback阈值={SURFACE_FALLBACK_MIN_SCORE}）"
-            )
+        # ---------------------------
+        # 真保底：至少给 1 条
+        # ---------------------------
+        if len(merged) < SURFACE_FORCE_MIN:
+            hard_exclude = list(set(exclude_ids + [r["id"] for r in merged]))
+            need = max(SURFACE_FORCE_MIN - len(merged), 0)
+
+            if need > 0:
+                if hard_exclude:
+                    force_rows = await conn.fetch("""
+                        SELECT
+                            id, content, importance, memory_type, resolved, activation_count,
+                            pinned, valence, arousal, project, created_at, last_accessed
+                        FROM memories
+                        WHERE id != ALL($1::int[])
+                        ORDER BY
+                            pinned DESC,
+                            (CASE WHEN resolved = FALSE THEN 1 ELSE 0 END) DESC,
+                            importance DESC,
+                            created_at DESC,
+                            COALESCE(last_accessed, created_at) DESC
+                        LIMIT $2
+                    """, hard_exclude, need)
+                else:
+                    force_rows = await conn.fetch("""
+                        SELECT
+                            id, content, importance, memory_type, resolved, activation_count,
+                            pinned, valence, arousal, project, created_at, last_accessed
+                        FROM memories
+                        ORDER BY
+                            pinned DESC,
+                            (CASE WHEN resolved = FALSE THEN 1 ELSE 0 END) DESC,
+                            importance DESC,
+                            created_at DESC,
+                            COALESCE(last_accessed, created_at) DESC
+                        LIMIT $1
+                    """, need)
+
+                forced = [dict(r) for r in force_rows]
+                if forced:
+                    print(f"🌫️ 真保底补入 {len(forced)} 条")
+                    for r in forced:
+                        print(
+                            f" 🌫️ [forced] "
+                            f"(imp={r['importance']}, resolved={r['resolved']}, pinned={r['pinned']}, "
+                            f"arousal={r.get('arousal')}, act={r.get('activation_count')}) "
+                            f"{r['content'][:70]}..."
+                        )
+                    merged = _dedupe_memory_rows(merged + forced)
+
+        final_rows = merged[:limit]
+
+        if final_rows:
+            print(f"🌫️ 主动浮现最终返回 {len(final_rows)} 条")
         else:
-            print(f"🌫️ 主动浮现最终返回 {len(final_rows[:limit])} 条")
+            print("🌫️ 主动浮现最终 0 条（库里可能确实没有可用记忆）")
 
-        return final_rows[:limit]
+        return final_rows
 
 
 async def get_recent_memories(limit: int = 20):
