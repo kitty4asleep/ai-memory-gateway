@@ -8,6 +8,7 @@ PROVIDERS = {
     "kongbeiqie":("KBQ_BASE_URL",       "KBQ_API_KEY"),        # https://api.空悲切.cn/v1/chat/completions
     "ciallo":    ("CIALLO_BASE_URL",    "CIALLO_API_KEY"),     # https://ioll.pp.ua/v1/chat/completions
 
+   "tree":    ("TREE_BASE_URL",    "TREE_API_KEY"),     # https://api.treegpt.top/v1/chat/completions
     "run":       ("RUN_BASE_URL",       "RUN_API_KEY"),        # https://runanytime.hxi.me/v1/chat/completions
     "zyra":      ("ZYRA_BASE_URL",      "ZYRA_API_KEY"),       # https://zyraonline.org/v1/chat/completions
     "ciwei":     ("CIWEI_BASE_URL",     "CIWEI_API_KEY"),      # https://cf-cc.cwapi.vip/v1/chat/completions
