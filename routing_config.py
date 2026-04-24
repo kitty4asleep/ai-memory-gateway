@@ -15,7 +15,7 @@ PROVIDERS = {
     "ciwei":     ("CIWEI_BASE_URL",     "CIWEI_API_KEY"),      # https://cf-cc.cwapi.vip/v1/chat/completions
     "sakura":    ("SAKURA_BASE_URL",    "SAKURA_API_KEY"),     # https://codex.sakurapy.de/v1/chat/completions
     "pond":      ("POND_BASE_URL",      "POND_API_KEY"),       # https://code.claudex.us.ci/v1/chat/completions
-    "ggboom":    ("GGBOOM_BASE_URL",    "GGBOOM_API_KEY"),     # https://ai.qaq.al/v1/chat/completions
+    "soul":    ("SOUL_BASE_URL",    "SOUL_API_KEY"),     # https://sunlea.de/v1/chat/completions
     "cups":      ("CUPS_BASE_URL",      "CUPS_API_KEY"),       # https://free-llm.cups.moe/v1/chat/completions
     "yizi":      ("YIZI_BASE_URL",      "YIZI_API_KEY"),       # https://api.cetaceang.qzz.io/v1/chat/completions
     "paolu":     ("PAOLU_BASE_URL",     "PAOLU_API_KEY"),      # https://api.sillytaverns.com/v1/chat/completions
