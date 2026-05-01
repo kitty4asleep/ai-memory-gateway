@@ -24,7 +24,7 @@ PROVIDERS = {
     "ekan":      ("EKAN_BASE_URL",      "EKAN_API_KEY"),       # https://api.ekan8.com/v1/chat/completions
     "wong":      ("WONG_BASE_URL",      "WONG_API_KEY"),       # https://wzw.pp.ua/v1/chat/completions
 
-    "qmbabyy":   ("QMBABYY_BASE_URL",   "QMBABYY_API_KEY"),    # https://qmbabyy.cn/v1/chat/completions
+    "miao":   ("MIAO_BASE_URL",   "MIAO_API_KEY"),    # https://api.baimeow.icu/v1/chat/completions
     "qwqtao":    ("QWQTAO_BASE_URL",    "QWQTAO_API_KEY"),     # https://newapi.qwqtao.one/v1/chat/completions
     "elysiver":  ("ELYSIVER_BASE_URL",  "ELYSIVER_API_KEY"),   # https://elysiver.h-e.top/v1/chat/completions
     "hotaru":    ("HOTARU_BASE_URL",    "HOTARU_API_KEY"),     # https://hotaruapi.com/v1/chat/completions
